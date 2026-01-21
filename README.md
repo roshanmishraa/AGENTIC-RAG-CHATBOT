@@ -315,7 +315,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 **Your Name** - [@yourtwitter](https://twitter.com/yourtwitter) - your.email@example.com
 
-Project Link: [https://github.com/yourusername/agentic-rag-chatbot](https://github.com/yourusername/agentic-rag-chatbot)
+Project Link: (https://github.com/roshanmishraaa/agentic-rag-chatbot)
 
 ---
 
@@ -376,6 +376,7 @@ streamlit cache clear
 
 **⭐ Star this repo if you find it helpful!**
 
-Made with ❤️ by [Your Name]
+Made with ❤️ by Roshan Mishra
 
 </div>
+
