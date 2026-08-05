@@ -1,283 +1,183 @@
-from __future__ import annotations  # ✅ MUST be first line
+from __future__ import annotations
+from typing import TypedDict, Annotated
+import operator
 
-import os
-import asyncio
-import threading
-from typing import Annotated, TypedDict, List, Optional
-from pydantic import BaseModel, Field
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
-# Make available globally
-import builtins
-builtins.Annotated = Annotated
-builtins.BaseModel = BaseModel
-builtins.Field = Field
-
-from langchain_core.messages import BaseMessage, SystemMessage, AIMessage
-from langchain_openai import ChatOpenAI
-
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
-
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-import aiosqlite
-
-# Optional LangSmith tracing (safe fallback)
-try:
-    from langsmith import traceable
-except Exception:
-    def traceable(*a, **kw):
-        def deco(fn): return fn
-        return deco
-
-from app.core.tools import ALL_TOOLS
 from app.settings import settings
+from app.core.rag import retrieve
+from app.core.query_rewriter import rewrite_query
+from app.core.reflection import reflect_on_answer
+from app.core.model_router import route_and_call, estimate_cost
+from app.core.memory import get_short_term_memory, append_short_term_memory
+from app.core.guardrails import check_input_safety, check_output_safety   # Phase 4 — stubbed for now
+from app.core.mcp_tools import get_mcp_tools
 
 
-# =========================================================
-# Backend event loop (for Streamlit / sync callers)
-# =========================================================
-
-_BACKEND_LOOP: Optional[asyncio.AbstractEventLoop] = None
-_BACKEND_THREAD: Optional[threading.Thread] = None
-_BACKEND_LOCK = threading.Lock()
-
-
-def ensure_backend_running():
-    """Ensure a dedicated asyncio loop is running in a background thread."""
-    global _BACKEND_LOOP, _BACKEND_THREAD
-
-    with _BACKEND_LOCK:
-        if _BACKEND_LOOP and _BACKEND_THREAD and _BACKEND_THREAD.is_alive():
-            return
-
-        _BACKEND_LOOP = asyncio.new_event_loop()
-
-        def _run():
-            asyncio.set_event_loop(_BACKEND_LOOP)
-            _BACKEND_LOOP.run_forever()
-
-        _BACKEND_THREAD = threading.Thread(target=_run, daemon=True)
-        _BACKEND_THREAD.start()
+class AgentState(TypedDict):
+    chat_id: str
+    user_id: str
+    document_ids: list[str] | None
+    query: str
+    rewritten_queries: list[str]
+    retrieved_chunks: list[dict]
+    needs_web_search: bool
+    answer: str
+    citations: list[dict]
+    model_used: str
+    tokens_used: int
+    cost_usd: float
+    reflection: dict
+    needs_human_review: bool
 
 
-def run_async(coro):
-    """Run coroutine on backend loop and BLOCK until result."""
-    ensure_backend_running()
-    return asyncio.run_coroutine_threadsafe(coro, _BACKEND_LOOP).result()
+# ============================================================
+# Nodes
+# ============================================================
+async def node_guardrail_input(state: AgentState) -> dict:
+    safety = await check_input_safety(state["query"])
+    if not safety["is_safe"]:
+        return {"answer": "I can't help with that request.", "needs_human_review": False,
+                "retrieved_chunks": [], "citations": [], "model_used": "blocked", "tokens_used": 0, "cost_usd": 0.0}
+    return {}
 
 
-def submit_async_task(coro):
-    """
-    ✅ THIS WAS MISSING
-    Submit coroutine to backend loop WITHOUT blocking.
-    Returns concurrent.futures.Future
-    """
-    ensure_backend_running()
-    return asyncio.run_coroutine_threadsafe(coro, _BACKEND_LOOP)
+async def node_rewrite(state: AgentState) -> dict:
+    history = await get_short_term_memory(state["chat_id"])
+    rewritten = await rewrite_query(state["query"], history)
+    return {"rewritten_queries": rewritten}
 
 
-# =========================================================
-# LLM (lazy, single instance)
-# =========================================================
+async def node_retrieve(state: AgentState) -> dict:
+    from app.db.session import AsyncSessionLocal
+    all_chunks = []
+    async with AsyncSessionLocal() as db:
+        for q in state["rewritten_queries"]:
+            chunks = await retrieve(db, q, document_ids=state.get("document_ids"))
+            all_chunks.extend(chunks)
 
-_llm: Optional[ChatOpenAI] = None
-_llm_with_tools = None
+    # dedupe by (document_id, chunk_index)
+    seen = set()
+    unique_chunks = []
+    for c in all_chunks:
+        key = (c["document_id"], c["chunk_index"])
+        if key not in seen:
+            seen.add(key)
+            unique_chunks.append(c)
 
-
-def get_llm():
-    global _llm
-    if _llm is None:
-        _llm = ChatOpenAI(
-            model=settings.OPENAI_MODEL,
-            api_key=settings.OPENAI_API_KEY,
-            temperature=getattr(settings, "LLM_TEMPERATURE", 0),
-        )
-    return _llm
-
-
-def get_llm_with_tools():
-    global _llm_with_tools
-    if _llm_with_tools is None:
-        try:
-            _llm_with_tools = get_llm().bind_tools(ALL_TOOLS)
-        except Exception:
-            _llm_with_tools = get_llm()
-    return _llm_with_tools
+    # If retrieval is weak (empty or low scores), flag for web search via MCP
+    needs_web = len(unique_chunks) == 0 or max((c["score"] for c in unique_chunks), default=0) < 0.3
+    return {"retrieved_chunks": unique_chunks[: settings.RAG_FINAL_K], "needs_web_search": needs_web}
 
 
-# =========================================================
-# Graph State (MEMORY ENABLED)
-# =========================================================
-
-class ChatState(TypedDict):
-    # add_messages ensures full conversation memory
-    messages: Annotated[List[BaseMessage], add_messages]
-
-
-# =========================================================
-# Chat Node (LLM)
-# =========================================================
-
-@traceable(name="chat_node", run_type="llm")
-async def chat_node(state: ChatState, config=None):
-    # Get thread_id from config
-    thread_id = None
-    has_document = False
-    
-    if config:
-        thread_id = config.get("configurable", {}).get("thread_id")
-        
-        # Check if document exists for this thread
-        if thread_id:
-            try:
-                from app.core.rag import thread_has_document
-                has_document = thread_has_document(thread_id)
-            except Exception:
-                pass
-    
-    # Build system prompt based on whether document exists
-    if has_document and thread_id:
-        system_prompt = (
-            "You are an intelligent AI assistant with access to tools.\n\n"
-            "⚠️ CRITICAL: A document has been uploaded and indexed for this conversation.\n"
-            "You MUST use the rag_tool to search the document before answering questions.\n\n"
-            "MANDATORY WORKFLOW:\n"
-            "1. For ANY user question, first call rag_tool to search the uploaded document\n"
-            f"2. Use these exact parameters: query='<user question>', thread_id='{thread_id}'\n"
-            "3. After receiving search results, answer based on the retrieved information\n"
-            "4. If the document doesn't contain relevant info, state that clearly\n\n"
-            "Available tools:\n"
-            "- rag_tool: Search the uploaded document (ALWAYS USE THIS FIRST)\n"
-            "- calculator: Perform math operations\n"
-            "- web_search: Search the internet\n"
-            "- get_stock_price: Get stock prices\n"
-        )
-    else:
-        system_prompt = (
-            "You are an intelligent AI assistant with access to tools.\n"
-            "Rules:\n"
-            "- Use tools when they would be helpful\n"
-            "- Keep answers concise and accurate\n"
-            "- For calculations, use the calculator tool\n"
-            "- For current info, use web_search\n"
-        )
-
-    messages = [SystemMessage(content=system_prompt)] + state["messages"]
-
-    try:
-        llm = get_llm_with_tools()
-        response = await llm.ainvoke(messages, config=config)
-        return {"messages": [response]}
-    except Exception as e:
-        return {"messages": [AIMessage(content=f"LLM error: {e}")]}
-
-
-# =========================================================
-# Tool Node (LangGraph native)
-# =========================================================
-
-def get_tool_node():
-    return ToolNode(ALL_TOOLS) if ALL_TOOLS else None
-
-
-# =========================================================
-# Checkpointer (SQLite, async)
-# =========================================================
-
-_checkpointer = None
-
-
-async def _init_checkpointer():
-    global _checkpointer
-
-    if _checkpointer is not None:
-        return _checkpointer
-
-    os.makedirs(os.path.dirname(settings.CHECKPOINT_DB_PATH), exist_ok=True)
-    
-    # ✅ Fix: Add check_same_thread=False
-    conn = await aiosqlite.connect(
-        settings.CHECKPOINT_DB_PATH,
-        check_same_thread=False  # This allows cross-thread access
+async def node_generate(state: AgentState) -> dict:
+    context_text = "\n\n".join(
+        f"[Source {i+1}] {c['content']}" for i, c in enumerate(state["retrieved_chunks"])
     )
-    _checkpointer = AsyncSqliteSaver(conn)
-    
-    # ✅ Initialize the checkpointer in the current loop
-    try:
-        await _checkpointer.setup()
-    except Exception:
-        pass  # setup might not exist in all versions
-    
-    return _checkpointer
+
+    system_prompt = (
+        "You are a helpful assistant. Answer using the provided context when relevant. "
+        "If the context doesn't contain the answer and you're not confident, say so honestly. "
+        "Cite sources using [Source N] notation."
+    )
+
+    tools = get_mcp_tools() if state["needs_web_search"] else []
+    tool_note = "\nYou have access to web search/fetch tools if the context is insufficient." if tools else ""
+
+    messages = [
+        SystemMessage(content=system_prompt + tool_note),
+        HumanMessage(content=f"Context:\n{context_text}\n\nQuestion: {state['query']}"),
+    ]
+
+    from app.core.model_router import QueryComplexity, classify_complexity
+    complexity = classify_complexity(state["query"])
+    response, model_used = await route_and_call(state["query"], messages, force_complexity=complexity)
+
+    input_tokens = response.usage_metadata.get("input_tokens", 0) if hasattr(response, "usage_metadata") else 0
+    output_tokens = response.usage_metadata.get("output_tokens", 0) if hasattr(response, "usage_metadata") else 0
+    cost = estimate_cost(model_used, input_tokens, output_tokens)
+
+    citations = [
+        {"document_id": c["document_id"], "page_number": c.get("page_number"), "chunk_index": c["chunk_index"]}
+        for c in state["retrieved_chunks"]
+    ]
+
+    return {
+        "answer": response.content,
+        "citations": citations,
+        "model_used": model_used,
+        "tokens_used": input_tokens + output_tokens,
+        "cost_usd": cost,
+    }
 
 
-def get_checkpointer():
-    return run_async(_init_checkpointer())
+async def node_reflect(state: AgentState) -> dict:
+    context_text = "\n\n".join(c["content"] for c in state["retrieved_chunks"])
+    verdict = await reflect_on_answer(state["query"], context_text, state["answer"])
+
+    needs_review = not verdict["is_grounded"] or verdict["confidence"] < 0.4
+    answer = state["answer"]
+    if needs_review:
+        answer += "\n\n*Note: This answer may need verification — flagged for review.*"
+
+    return {"reflection": verdict, "needs_human_review": needs_review, "answer": answer}
 
 
-# =========================================================
-# Graph compilation (lazy, cached)
-# =========================================================
-
-_compiled_graph = None
-
-
-async def _build_graph():
-    global _compiled_graph
-
-    if _compiled_graph is not None:
-        return _compiled_graph
-
-    graph = StateGraph(ChatState)
-
-    graph.add_node("chat", chat_node)
-    graph.add_edge(START, "chat")
-
-    tool_node = get_tool_node()
-    if tool_node:
-        graph.add_node("tools", tool_node)
-        graph.add_conditional_edges("chat", tools_condition)
-        graph.add_edge("tools", "chat")
-    else:
-        graph.add_edge("chat", END)
-
-    saver = await _init_checkpointer()
-    _compiled_graph = graph.compile(checkpointer=saver)
-
-    return _compiled_graph
+async def node_guardrail_output(state: AgentState) -> dict:
+    safety = await check_output_safety(state["answer"])
+    if not safety["is_safe"]:
+        return {"answer": "I generated a response but it didn't pass our safety check. Please rephrase your question."}
+    return {}
 
 
-def get_compiled_chatbot():
-    return run_async(_build_graph())
-
-async def warmup_graph_if_needed():
-    """Called on FastAPI startup to pre-compile the graph and checkpointer."""
-    await _build_graph()
+async def node_save_memory(state: AgentState) -> dict:
+    await append_short_term_memory(state["chat_id"], "user", state["query"])
+    await append_short_term_memory(state["chat_id"], "assistant", state["answer"])
+    return {}
 
 
-# =========================================================
-# Proxy (prevents heavy import-time init)
-# =========================================================
-
-class _ChatbotProxy:
-    def __getattr__(self, name):
-        return getattr(get_compiled_chatbot(), name)
-
-    def __call__(self, *a, **kw):
-        return get_compiled_chatbot()(*a, **kw)
+# ============================================================
+# Conditional routing
+# ============================================================
+def route_after_input_guardrail(state: AgentState) -> str:
+    return "end" if state.get("model_used") == "blocked" else "continue"
 
 
-chatbot = _ChatbotProxy()
+# ============================================================
+# Build graph
+# ============================================================
+def build_graph():
+    graph = StateGraph(AgentState)
 
-class _CheckpointerProxy:
-    """
-    Lazy proxy for checkpointer so legacy imports
-    (langgraph_mcp_backend) do not break.
-    """
-    def __getattr__(self, name):
-        saver = get_checkpointer()
-        return getattr(saver, name)
+    graph.add_node("guardrail_input", node_guardrail_input)
+    graph.add_node("rewrite", node_rewrite)
+    graph.add_node("retrieve", node_retrieve)
+    graph.add_node("generate", node_generate)
+    graph.add_node("reflect", node_reflect)
+    graph.add_node("guardrail_output", node_guardrail_output)
+    graph.add_node("save_memory", node_save_memory)
 
-_checkpointer_ref = _CheckpointerProxy()
+    graph.set_entry_point("guardrail_input")
+    graph.add_conditional_edges(
+        "guardrail_input", route_after_input_guardrail, {"end": END, "continue": "rewrite"}
+    )
+    graph.add_edge("rewrite", "retrieve")
+    graph.add_edge("retrieve", "generate")
+    graph.add_edge("generate", "reflect")
+    graph.add_edge("reflect", "guardrail_output")
+    graph.add_edge("guardrail_output", "save_memory")
+    graph.add_edge("save_memory", END)
+
+    return graph
+
+
+async def get_compiled_graph():
+    """Compiled with Postgres checkpointer — replaces the old SQLite one,
+    safe for multi-worker production deployment."""
+    graph = build_graph()
+    async with AsyncPostgresSaver.from_conn_string(settings.DATABASE_URL.replace("+asyncpg", "")) as checkpointer:
+        await checkpointer.setup()
+        return graph.compile(checkpointer=checkpointer)
 

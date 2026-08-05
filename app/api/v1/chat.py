@@ -1,139 +1,57 @@
-from fastapi import APIRouter, Request, HTTPException
-from app.auth.utils import get_current_user
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi import APIRouter, Request, HTTPException, Depends
-from typing import Dict, Any, AsyncGenerator
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel
 
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.messages import ToolMessage   # correct import
+from app.db.session import get_db
+from app.db.models import Chat, Message, User
+from app.security.rbac import get_current_user
+from app.security.rate_limiter import rate_limit_dependency
+from app.core.graph import get_compiled_graph
 
-# FIXED IMPORT – correct module path
-from app.langgraph_mcp_backend import chatbot
-
-
-router = APIRouter()
+router = APIRouter(prefix="/chat", tags=["chat"])
 
 
-# =============================================================
-#  STREAMING GENERATOR (Safe, Robust, LangGraph-compatible)
-# =============================================================
-async def _token_generator(payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
-    """
-    Yields tokens or chunks from LangGraph chatbot.
-    Handles AIMessage, ToolMessage, dict events, fallback outputs.
-    """
-
-    try:
-        async for chunk, meta in chatbot.astream(
-            payload,
-            config=payload.get("config", {}),
-            stream_mode="messages"
-        ):
-            if chunk is None:
-                continue
-
-            # 1️⃣ LLM messages
-            if isinstance(chunk, AIMessage):
-                if chunk.content:
-                    yield chunk.content
-                continue
-
-            # 2️⃣ Tool invocation events
-            if isinstance(chunk, ToolMessage):
-                tool_name = getattr(chunk, "name", "tool")
-                yield f"[tool:{tool_name}] "
-                continue
-
-            # 3️⃣ LangGraph event dictionaries
-            if isinstance(chunk, dict):
-                # Unified handling of dict events
-                if "content" in chunk and isinstance(chunk["content"], str):
-                    yield chunk["content"]
-                elif "message" in chunk:
-                    yield str(chunk["message"])
-                else:
-                    yield str(chunk)
-                continue
-
-            # 4️⃣ Fallback
-            yield str(chunk)
-
-    except Exception as exc:
-        # Stream-safe error reporting
-        yield f"\n[Stream Error] {str(exc)}"
+class ChatRequest(BaseModel):
+    chat_id: str
+    query: str
+    document_ids: list[str] | None = None
 
 
-# =============================================================
-#  STREAMING ENDPOINT  (Used by Streamlit)
-# =============================================================
-@router.post("/chat/stream")
-async def chat_stream(request: Request, current_user: dict = Depends(get_current_user)):
-    """
-    Payload:
-    {
-        "message": "hello",
-        "thread_id": "uuid123"
-    }
-    """
+@router.post("/message", dependencies=[Depends(rate_limit_dependency)])
+async def send_message(
+    payload: ChatRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    graph = await get_compiled_graph()
 
-    body = await request.json()
-
-    message = body.get("message")
-    thread_id = body.get("thread_id")
-
-    if not message:
-        raise HTTPException(status_code=400, detail="Missing 'message'")
-    if not thread_id:
-        raise HTTPException(status_code=400, detail="Missing 'thread_id'")
-
-    payload = {
-        "messages": [HumanMessage(content=message)],
-        "config": {
-            "configurable": {"thread_id": thread_id},
-            "metadata": {
-                "thread_id": thread_id,
-                "endpoint": "stream_chat"
-            },
-            "run_name": "chat_turn"
+    result = await graph.ainvoke(
+        {
+            "chat_id": payload.chat_id,
+            "user_id": user.id,
+            "document_ids": payload.document_ids,
+            "query": payload.query,
         },
-    }
-
-    return StreamingResponse(
-        _token_generator(payload),
-        media_type="text/plain"
+        config={"configurable": {"thread_id": payload.chat_id}},
     )
 
+    # Persist to Postgres (Message table) — separate from the LangGraph checkpoint,
+    # this is what admin.py's usage_stats endpoint aggregates from
+    message = Message(
+        chat_id=payload.chat_id,
+        role="assistant",
+        content=result["answer"],
+        citations={"sources": result.get("citations", [])},
+        model_used=result.get("model_used", ""),
+        tokens_used=result.get("tokens_used", 0),
+        cost_usd=result.get("cost_usd", 0.0),
+    )
+    db.add(message)
+    await db.commit()
 
-# =============================================================
-#  NON-STREAMING ENDPOINT (returns full reply)
-# =============================================================
-@router.post("/chat")
-async def chat_sync(body: Dict[str, Any],current_user: dict = Depends(get_current_user)):
-    """
-    Same functionality as streaming, but returns complete text.
-    """
-
-    message = body.get("message")
-    thread_id = body.get("thread_id")
-
-    if not message or not thread_id:
-        raise HTTPException(status_code=400, detail="Missing message or thread_id")
-
-    payload = {
-        "messages": [HumanMessage(content=message)],
-        "config": {
-            "configurable": {"thread_id": thread_id},
-            "metadata": {
-                "thread_id": thread_id,
-                "endpoint": "sync_chat"
-            },
-            "run_name": "chat_turn"
-        },
+    return {
+        "answer": result["answer"],
+        "citations": result.get("citations", []),
+        "model_used": result.get("model_used"),
+        "needs_human_review": result.get("needs_human_review", False),
     }
-
-    chunks = []
-    async for token in _token_generator(payload):
-        chunks.append(token)
-
-    return JSONResponse({"reply": "".join(chunks)})
-

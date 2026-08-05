@@ -1,118 +1,66 @@
 from __future__ import annotations
-from typing import Annotated
-import asyncio
-import inspect
 import logging
-import sys
-import typing
-from typing import Annotated, Dict, Any, Optional
-from pydantic import BaseModel, Field
 
-# Make available globally
-import builtins
-builtins.Annotated = Annotated
-builtins.BaseModel = BaseModel
-builtins.Field = Field
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
-globals()['Annotated'] = typing.Annotated
-# Try optional MCP adapter
-try:
-    from langchain_mcp_adapters.client import MultiServerMCPClient
-except Exception:
-    MultiServerMCPClient = None
+from app.settings import settings
 
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# MCP Configuration (Disabled by default unless configured)
+# MCP Server Configuration
 # ============================================================
-
-DEFAULT_CONFIG = {
-    # Example only. Disabled until user configures MCP scripts.
-    # "arith": {
-    #     "transport": "stdio",
-    #     "command": sys.executable,  # safer than "python3"
-    #     "args": ["arith_server.py"],
-    # }
+# All three are free, official/community reference servers.
+# Brave Search needs a free API key (2000 queries/month free tier).
+MCP_CONFIG = {
+    "fetch": {
+        "transport": "stdio",
+        "command": "uvx",
+        "args": ["mcp-server-fetch"],
+    },
+    "sequential_thinking": {
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+    },
 }
 
-# Storage for loaded tools
-MCP_TOOLS = []
+# Brave Search only added if the API key is actually configured — avoids
+# startup failures for people who haven't set it up yet.
+if settings.BRAVE_SEARCH_API_KEY:
+    MCP_CONFIG["brave_search"] = {
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+        "env": {"BRAVE_API_KEY": settings.BRAVE_SEARCH_API_KEY},
+    }
+
+_mcp_client: MultiServerMCPClient | None = None
+MCP_TOOLS: list = []
 
 
-# ============================================================
-# Async loader
-# ============================================================
-
-async def _load_mcp_tools_async() -> list:
+async def load_mcp_tools() -> list:
     """
-    Load MCP tools from configured servers.
-    This function is async and safe to call via run_async().
+    Called once on app startup (from main.py lifespan).
+    If any MCP server fails to connect, we log it and continue with an empty
+    tool list — MCP is an enhancement, not a hard dependency for the app to run.
     """
+    global _mcp_client, MCP_TOOLS
 
-    if MultiServerMCPClient is None:
-        logger.info("MCP adapter not installed — skipping MCP tools.")
-        return []
-
-    if not DEFAULT_CONFIG:
-        logger.info("No MCP servers configured — skipping MCP tools.")
+    if not MCP_CONFIG:
+        logger.info("No MCP servers configured — skipping.")
         return []
 
     try:
-        client = MultiServerMCPClient(DEFAULT_CONFIG)
-
-        tools = client.get_tools()
-
-        # get_tools can be sync or async
-        if inspect.isawaitable(tools):
-            tools = await tools
-
-        # ✅ Fix namespace for each tool
-        import typing
-        for tool in (tools or []):
-            try:
-                # Try to inject Annotated into the tool's namespace
-                if hasattr(tool, 'func') and hasattr(tool.func, '__globals__'):
-                    tool.func.__globals__['Annotated'] = typing.Annotated
-                elif callable(tool) and hasattr(tool, '__globals__'):
-                    tool.__globals__['Annotated'] = typing.Annotated
-            except Exception as e:
-                logger.warning(f"Could not inject Annotated into tool namespace: {e}")
-
-        logger.info(f"MCP tools loaded: {len(tools)}")
-        return tools or []
-
+        _mcp_client = MultiServerMCPClient(MCP_CONFIG)
+        MCP_TOOLS = await _mcp_client.get_tools()
+        logger.info(f"MCP tools loaded: {[t.name for t in MCP_TOOLS]}")
+        return MCP_TOOLS
     except Exception as exc:
-        logger.error(f"MCP tool loading failed: {exc}", exc_info=True)
-        return []
-
-
-# ============================================================
-# Public safe loader — called from main.py startup
-# ============================================================
-
-def load_mcp_tools_safely():
-    """
-    Load MCP tools using LangGraph’s backend event loop.
-    This function MUST NOT block FastAPI's event loop.
-    """
-
-    from app.core.graph import run_async  # lazy import to avoid circular issues
-
-    global MCP_TOOLS
-
-    try:
-        MCP_TOOLS = run_async(_load_mcp_tools_async()) or []
-    except Exception as exc:
-        logger.error(f"MCP tool load error: {exc}")
+        logger.error(f"MCP tool loading failed, continuing without MCP tools: {exc}")
         MCP_TOOLS = []
+        return []
 
+
+def get_mcp_tools() -> list:
     return MCP_TOOLS
-
-
-# ============================================================
-# IMPORTANT: No auto-load at import time!
-# ============================================================
-# (We intentionally DO NOT auto-load tools here.)
-# Tools are loaded from main.py startup event.
-

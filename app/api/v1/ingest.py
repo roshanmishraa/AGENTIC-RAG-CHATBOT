@@ -1,147 +1,125 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
-from app.auth.utils import get_current_user
-from typing import Optional
-import asyncio
-import requests
-from bs4 import BeautifulSoup
+from __future__ import annotations
+import io
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
+from docx import Document as DocxDocument
+import pandas as pd
 
-# Safe LangSmith import
-try:
-    from langsmith import traceable
-except Exception:
-    def traceable(*a, **kw):
-        def deco(fn): return fn
-        return deco
+from app.db.session import get_db
+from app.db.models import Document, User
+from app.db.vectorstore import upsert_chunks
+from app.security.rbac import get_current_user
+from app.security.rate_limiter import rate_limit_dependency
+from app.settings import settings
+from app.observability.logger import get_logger
 
-router = APIRouter()
+router = APIRouter(prefix="/ingest", tags=["ingest"])
+logger = get_logger(__name__)
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=settings.CHUNK_SIZE,
+    chunk_overlap=settings.CHUNK_OVERLAP,
+)
 
 
-# ===============================================================
-# 📌 PDF Upload Endpoint
-# ===============================================================
-@traceable(name="upload_pdf_ingestion", run_type="tool")
-@router.post("/upload")
-async def upload_pdf(
+def _extract_pdf(file_bytes: bytes) -> list[dict]:
+    """Returns [{"text": str, "page_number": int}, ...] — one entry per page."""
+    reader = PdfReader(io.BytesIO(file_bytes))
+    pages = []
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text() or ""
+        if text.strip():
+            pages.append({"text": text, "page_number": i + 1})
+    return pages
+
+
+def _extract_docx(file_bytes: bytes) -> list[dict]:
+    doc = DocxDocument(io.BytesIO(file_bytes))
+    full_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    return [{"text": full_text, "page_number": None}]   # docx has no native page concept
+
+
+def _extract_csv(file_bytes: bytes) -> list[dict]:
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    # Represent each row as a readable text line — keeps CSV data searchable via RAG
+    text = df.to_string(index=False)
+    return [{"text": text, "page_number": None}]
+
+
+EXTRACTORS = {
+    "pdf": _extract_pdf,
+    "docx": _extract_docx,
+    "csv": _extract_csv,
+}
+
+
+@router.post("/upload", dependencies=[Depends(rate_limit_dependency)])
+async def upload_document(
     file: UploadFile = File(...),
-    thread_id: Optional[str] = Form(None),
-    current_user: dict = Depends(get_current_user)
-
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    """
-    Upload a PDF and ingest into Pinecone for RAG.
-    """
+    file_ext = file.filename.split(".")[-1].lower()
+    if file_ext not in EXTRACTORS:
+        raise HTTPException(400, f"Unsupported file type: {file_ext}. Supported: {list(EXTRACTORS.keys())}")
 
-    if not thread_id:
-        raise HTTPException(status_code=400, detail="thread_id is required")
+    file_bytes = await file.read()
 
-    # Limit file size (optional but recommended)
-    MAX_SIZE = 20 * 1024 * 1024  # 20 MB
+    document = Document(
+        owner_id=user.id,
+        filename=file.filename,
+        file_type=file_ext,
+        status="processing",
+    )
+    db.add(document)
+    await db.commit()
+    await db.refresh(document)
 
     try:
-        file_bytes = await file.read()
+        pages = EXTRACTORS[file_ext](file_bytes)
+        if not pages:
+            raise ValueError("No extractable text found in file")
 
-        if len(file_bytes) > MAX_SIZE:
-            raise HTTPException(status_code=413, detail="PDF too large (limit 20MB)")
+        # Chunk each page/section, preserving page numbers for citations
+        chunks = []
+        chunk_index = 0
+        for page in pages:
+            page_chunks = splitter.split_text(page["text"])
+            for chunk_text in page_chunks:
+                chunks.append({
+                    "content": chunk_text,
+                    "chunk_index": chunk_index,
+                    "page_number": page["page_number"],
+                })
+                chunk_index += 1
 
-        # Lazy import (to avoid startup crash)
-        from app.core.rag import ingest_pdf_bytes
+        await upsert_chunks(db, document.id, chunks)
 
-        result = await ingest_pdf_bytes(
-            file_bytes=file_bytes,
-            thread_id=str(thread_id),
-            filename=file.filename
-        )
-        # Validate ingestion produced actual chunks
-        chunks = result.get("chunks", 0)
-        if chunks == 0:
-            raise HTTPException(
-                status_code=422,
-                detail="PDF was uploaded but no content could be extracted. "
-                       "Check if the PDF has selectable text (not a scanned image)."
-            )
+        document.status = "ready"
+        await db.commit()
 
+        logger.info(f"Document ingested: {file.filename} ({len(chunks)} chunks)",
+                    extra={"user_id": user.id})
 
-        return {
-            "status": "success",
-            "message": "PDF ingested successfully",
-            "thread_id": thread_id,
-            "ingested_by": current_user.get("username", current_user.get("sub")),
-            "metadata": result,
-        }
+        return {"document_id": document.id, "filename": document.filename,
+                "status": "ready", "chunks_created": len(chunks)}
 
-    except HTTPException:
-        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {exc}")
+        document.status = "failed"
+        await db.commit()
+        logger.error(f"Ingestion failed for {file.filename}: {exc}", extra={"user_id": user.id})
+        raise HTTPException(500, f"Failed to process document: {str(exc)}")
 
 
-# ===============================================================
-# 📌 URL → extract <p> text → Pinecone embedding
-# ===============================================================
-@traceable(name="url_text_ingestion", run_type="tool")
-@router.post("/ingest_url")
-async def ingest_url(
-    url: str = Form(...),
-    thread_id: Optional[str] = Form(None),
-    current_user: dict = Depends(get_current_user)
-):
-    """Fetch webpage content, extract paragraphs, embed them, store in Pinecone."""
-
-    if not thread_id:
-        raise HTTPException(status_code=400, detail="thread_id is required")
-
-    try:
-        # NON-BLOCKING HTTP request
-        resp = await asyncio.to_thread(requests.get, url, timeout=10)
-        resp.raise_for_status()
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        paragraphs = [
-            p.get_text(separator=" ", strip=True)
-            for p in soup.find_all("p")
-        ]
-
-        extracted_text = " ".join(paragraphs).strip()
-
-        if not extracted_text:
-            raise HTTPException(
-                status_code=400,
-                detail="No extractable <p> text found on the webpage"
-            )
-
-        # Limit text length (OpenAI embedding max ~800k chars, but better safe)
-        MAX_CHARS = 200_000
-        if len(extracted_text) > MAX_CHARS:
-            extracted_text = extracted_text[:MAX_CHARS]
-
-        text_bytes = extracted_text.encode("utf-8")
-
-        # Lazy import of RAG ingestion
-        from app.core.rag import ingest_text_bytes
-
-        result = await ingest_text_bytes(
-            text_bytes=text_bytes,
-            thread_id=str(thread_id),
-            filename=url
-        )
-        chunks = result.get("chunks", 0)
-        if chunks == 0:
-            raise HTTPException(
-                status_code=422,
-                detail="URL was fetched but no content could be indexed."
-            )
-
-        return {
-            "status": "success",
-            "message": f"URL text ingested successfully({chunks} chunks indexed)",
-            "thread_id": thread_id,
-            "ingested_by": current_user.get("username", current_user.get("sub")),
-            "metadata": result,
-        }
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"URL ingestion failed: {exc}")
-
+@router.get("/documents")
+async def list_documents(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import select
+    result = await db.execute(select(Document).where(Document.owner_id == user.id))
+    docs = result.scalars().all()
+    return [
+        {"id": d.id, "filename": d.filename, "file_type": d.file_type,
+         "status": d.status, "uploaded_at": d.uploaded_at}
+        for d in docs
+    ]
