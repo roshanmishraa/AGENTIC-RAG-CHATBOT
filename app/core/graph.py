@@ -12,7 +12,6 @@ from app.core.reflection import reflect_on_answer
 from app.core.model_router import route_and_call, estimate_cost, classify_complexity
 from app.core.memory import get_short_term_memory, append_short_term_memory
 from app.core.guardrails import check_input_safety, check_output_safety
-from app.core.mcp_tools import get_mcp_tools
 from app.core.tools import get_custom_tools
 from app.observability.tool_monitor import execute_tool_with_observability
 from app.observability.token_monitor import log_usage
