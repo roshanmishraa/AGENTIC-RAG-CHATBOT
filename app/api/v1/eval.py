@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
-from app.auth.utils import get_current_user
+from app.security.rbac import get_current_user
 
 router = APIRouter()
 

@@ -1,82 +1,108 @@
 from pydantic_settings import BaseSettings
 from pydantic import ConfigDict
-from typing import Optional
 import os
 
+
 class Settings(BaseSettings):
-    """
-    Central configuration for the entire Agentic RAG Chatbot project.
-    Loaded automatically from environment variables or .env file.
-    """
-    
+    """Central configuration for the entire Agentic RAG Chatbot project."""
+
     # -----------------------------
-    # OpenAI / LLM Settings
+    # App
+    # -----------------------------
+    APP_ENV: str = "development"
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+    SECRET_KEY: str = "change-me-in-production"
+
+    # -----------------------------
+    # Database (Postgres)
+    # -----------------------------
+    DATABASE_URL: str = "postgresql+asyncpg://rag_user:rag_password@localhost:5432/rag_chatbot"
+
+    # -----------------------------
+    # Redis
+    # -----------------------------
+    REDIS_URL: str = "redis://localhost:6379/0"
+    RATE_LIMIT_PER_MINUTE: int = 20
+    LLM_CACHE_TTL_SECONDS: int = 3600
+
+    # -----------------------------
+    # Auth (JWT)
+    # -----------------------------
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+
+    # -----------------------------
+    # Email OTP (SMTP)
+    # -----------------------------
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""          # Gmail App Password, not your regular password
+    SMTP_FROM_EMAIL: str = ""
+    OTP_MODE: str = "mock"           # "mock" = print in logs (safe for demo), "live" = actually send
+
+    # -----------------------------
+    # Google OAuth2.0
+    # -----------------------------
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/api/v1/auth/google/callback"
+
+    # -----------------------------
+    # LLM Providers (primary + fallback)
     # -----------------------------
     OPENAI_API_KEY: str = ""
-    OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENAI_MODEL_SMALL: str = "gpt-4o-mini"
+    OPENAI_MODEL_LARGE: str = "gpt-4o"
+
+    GOOGLE_API_KEY: str = ""
+    GOOGLE_MODEL: str = "gemini-1.5-flash"
+
     EMBEDDING_MODEL: str = "text-embedding-3-small"
 
     # -----------------------------
-    # Vector Database (Pinecone Only)
+    # Vector Backend (dual support)
     # -----------------------------
-    VECTOR_BACKEND: str = "pinecone"     # ALWAYS pinecone for your project
+    VECTOR_BACKEND: str = "pgvector"      # "pgvector" | "pinecone" — pgvector chosen since local Postgres already has the extension
 
     PINECONE_API_KEY: str = ""
-    PINECONE_ENVIRONMENT: str = "us-east-1"  # Or the region your index uses
+    PINECONE_ENVIRONMENT: str = "us-east-1"
     PINECONE_INDEX_NAME: str = "agentic-rag-index"
     PINECONE_NAMESPACE: str = "default"
 
     # -----------------------------
-    # LangSmith (Optional, but recommended)
+    # MCP / External Tools
+    # -----------------------------
+    BRAVE_SEARCH_API_KEY: str = ""
+    ALPHAVANTAGE_API_KEY: str = ""
+
+    # -----------------------------
+    # LangSmith Observability
     # -----------------------------
     LANGSMITH_API_KEY: str = ""
-    LANGCHAIN_ENDPOINT: str = "https://api.smith.langchain.com"
     LANGCHAIN_TRACING_V2: bool = True
     LANGCHAIN_PROJECT: str = "agentic-rag-chatbot"
+    LANGCHAIN_ENDPOINT: str = "https://api.smith.langchain.com"
 
     # -----------------------------
     # RAG / Retrieval Config
     # -----------------------------
-    RAG_K: int = 4  # Number of documents to retrieve
+    RAG_TOP_K: int = 8              # candidates retrieved before reranking
+    RAG_FINAL_K: int = 4            # final chunks sent to the LLM
+    CHUNK_SIZE: int = 1000
+    CHUNK_OVERLAP: int = 200
+    USE_HYBRID_SEARCH: bool = True
+    USE_RERANKER: bool = True
+    USE_CONTEXT_COMPRESSION: bool = True
 
-    # -----------------------------
-    # Checkpointing (LangGraph)
-    # -----------------------------
-    CHECKPOINT_DB_PATH: str = "./data/chatbot_checkpoints.db"
-
-    # -----------------------------
-    # Metadata Store (Optional)
-    # -----------------------------
-    METADB_URL: str = "sqlite:///./data/meta.db"
-
-    # -----------------------------
-    # External APIs (Tools)
-    # -----------------------------
-    ALPHAVANTAGE_API_KEY: str = ""
-
-    # -----------------------------
-    # FastAPI App Server Config
-    # -----------------------------
-    HOST: str = "0.0.0.0"
-    PORT: int = 8000
-
-    # ✅ Pydantic v2 Configuration (CHANGED FROM class Config)
     model_config = ConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",  # Ignore extra fields in .env
-        case_sensitive=False
+        extra="ignore",
+        case_sensitive=False,
     )
 
 
 settings = Settings()
-
-# Set LangSmith environment variables
-if settings.LANGSMITH_API_KEY:
-    os.environ["LANGSMITH_API_KEY"] = settings.LANGSMITH_API_KEY
-    os.environ["LANGCHAIN_TRACING_V2"] = str(settings.LANGCHAIN_TRACING_V2).lower()
-    os.environ["LANGCHAIN_PROJECT"] = settings.LANGCHAIN_PROJECT
-    os.environ["LANGCHAIN_ENDPOINT"] = settings.LANGCHAIN_ENDPOINT
-    print(f"✅ LangSmith tracing enabled for project: {settings.LANGCHAIN_PROJECT}")
-else:
-    print("⚠️ LangSmith API key not found - tracing disabled")

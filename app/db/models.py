@@ -37,6 +37,11 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    # --- NEW: added for multi-auth support (password + email-OTP + Google OAuth) ---
+    phone_number: Mapped[str] = mapped_column(String(20), nullable=True)         # optional, stored at signup, not used for login
+    auth_provider: Mapped[str] = mapped_column(String(20), default="password")   # "password" | "otp" | "google"
+    google_id: Mapped[str] = mapped_column(String(255), nullable=True, unique=True)  # Google's unique "sub" claim
+
     chats: Mapped[list["Chat"]] = relationship(back_populates="user")
     documents: Mapped[list["Document"]] = relationship(back_populates="owner")
 
@@ -50,7 +55,7 @@ class Document(Base):
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
     owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
-    file_type: Mapped[str] = mapped_column(String(50))   # pdf | docx | csv | url
+    file_type: Mapped[str] = mapped_column(String(50))   # pdf | docx | csv | url | image
     status: Mapped[str] = mapped_column(String(50), default="processing")  # processing|ready|failed
     uploaded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
