@@ -1,15 +1,14 @@
 # ============================================================
-# Python
+# Python Backend
 # ============================================================
-# Byte-compiled / optimized / DLL files
+
 __pycache__/
 *.py[cod]
 *$py.class
 
-# C extensions
 *.so
 
-# Distribution / packaging
+# Packaging
 .Python
 build/
 develop-eggs/
@@ -21,297 +20,200 @@ lib/
 lib64/
 parts/
 sdist/
-var/
 wheels/
-share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
 
-# PyInstaller
-*.manifest
-*.spec
-
-# Installer logs
+# Logs
+*.log
 pip-log.txt
-pip-delete-this-directory.txt
 
-# Unit test / coverage reports
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
 htmlcov/
 .tox/
 .nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
 
-# Translations
-*.mo
-*.pot
+# Jupyter
+.ipynb_checkpoints/
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-.pybuilder/
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-.python-version
-
-# pipenv
-Pipfile.lock
-
-# poetry
-poetry.lock
-
-# pdm
-.pdm.toml
-
-# PEP 582
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
+# Environment
 .env
-.venv
-env/
+.env.*
+!.env.example
+
+.venv/
 venv/
+env/
 ENV/
-env.bak/
-venv.bak/
 agivenv/
 .agivenv/
 
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
 
 # ============================================================
-# IDEs and Editors
+# Database
 # ============================================================
-# VSCode
-.vscode/
-*.code-workspace
 
-# PyCharm
-.idea/
-*.iml
-*.iws
-*.ipr
-out/
-
-# Sublime Text
-*.sublime-project
-*.sublime-workspace
-
-# Vim
-*.swp
-*.swo
-*~
-
-# Emacs
-*~
-\#*\#
-.\#*
-
-# ============================================================
-# Operating System
-# ============================================================
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
-Icon
-._*
-.Spotlight-V100
-.Trashes
-
-# Windows
-Thumbs.db
-Thumbs.db:encryptable
-ehthumbs.db
-ehthumbs_vista.db
-*.stackdump
-[Dd]esktop.ini
-$RECYCLE.BIN/
-*.cab
-*.msi
-*.msix
-*.msm
-*.msp
-*.lnk
-
-# Linux
-.directory
-.Trash-*
-
-# ============================================================
-# Project Specific
-# ============================================================
-# Environment variables (CRITICAL - contains API keys)
-.env
-.env.local
-.env.*.local
-
-# Database files (user-specific data)
 *.db
 *.sqlite
 *.sqlite3
+
 data/*.db
 data/*.sqlite
+data/*.sqlite3
+
 chatbot_checkpoints.db
+*.db-shm
+*.db-wal
 
-# Logs
+
+# ============================================================
+# FastAPI / Backend Runtime
+# ============================================================
+
 logs/
-*.log
-log.txt
-
-# Temporary files
-temp/
 tmp/
-*.tmp
+temp/
 
-# Uploaded files (if storing locally)
 uploads/
 uploaded_files/
-*.pdf
-*.docx
-*.xlsx
 
-# Vector database (Pinecone is cloud, but if local)
+
+# ============================================================
+# AI / ML / RAG
+# ============================================================
+
 vector_store/
 faiss_index/
 chroma_db/
 
-# Model cache
 models/
-.cache/
 huggingface_cache/
 
-# Streamlit
-.streamlit/secrets.toml
-.streamlit/config.toml
-
-# FastAPI
-.pytest_cache/
-
-# LangChain/LangSmith
-langchain_cache/
+.cache/
 .langchain/
+langchain_cache/
 
-# Checkpoints (user threads - optional)
 checkpoints/
 *.checkpoint
 
+
 # ============================================================
-# Security & Secrets (IMPORTANT!)
+# React Frontend
 # ============================================================
-# API Keys
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Environment variables
+frontend/.env
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.production.local
+
+# Vite cache
+.vite/
+
+# React cache
+.eslintcache
+
+# npm logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Optional package manager caches
+.pnpm-store/
+
+
+# ============================================================
+# IDE
+# ============================================================
+
+.vscode/
+*.code-workspace
+
+.idea/
+*.iml
+*.iws
+*.ipr
+
+*.swp
+*.swo
+
+
+# ============================================================
+# OS Files
+# ============================================================
+
+.DS_Store
+
+Thumbs.db
+Thumbs.db:encryptable
+desktop.ini
+
+
+# ============================================================
+# Streamlit (old frontend)
+# ============================================================
+
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+
+# ============================================================
+# Security Secrets
+# ============================================================
+
 *.key
 *.pem
-*.env
+
 secrets.json
 credentials.json
 service-account.json
 
-# SSL Certificates
-*.crt
-*.cer
-*.der
-
-# SSH Keys
 id_rsa
 id_rsa.pub
 *.ppk
 
+
 # ============================================================
-# Build & Deployment
+# Certificates
 # ============================================================
-# Docker
+
+*.crt
+*.cer
+*.der
+
+
+# ============================================================
+# Docker / Deployment
+# ============================================================
+
 docker-compose.override.yml
 .dockerignore
 
-# Kubernetes
-*.kubeconfig
-
-# Terraform
 *.tfstate
 *.tfstate.*
 .terraform/
 
-# ============================================================
-# Misc
-# ============================================================
-# Backup files
-*.bak
-*.backup
-*~
 
-# Archive files
+# ============================================================
+# Archives
+# ============================================================
+
 *.zip
 *.tar.gz
 *.rar
 
-# Node (if using any JS tools)
-node_modules/
-package-lock.json
-
-# MacOS metadata
-.DS_Store
-
-# Windows thumbnails
-Thumbs.db
+*.bak
+*.backup
+*~

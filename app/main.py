@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import ingest, chat, health
+from app.api.v1 import ingest, chat, health, auth
 from app.core.mcp_tools import load_mcp_tools_safely
 from app.core.graph import ensure_backend_running, warmup_graph_if_needed
 from app.settings import settings
@@ -45,6 +45,7 @@ app.add_middleware(
 app.include_router(ingest.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(health.router, prefix="/api/v1")
+app.include_router(auth.router, prefix="/api/v1")
 
 
 # ============================================================

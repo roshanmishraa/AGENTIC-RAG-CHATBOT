@@ -1,4 +1,5 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from app.auth.utils import get_current_user
 from typing import Optional
 import asyncio
 import requests
@@ -22,7 +23,9 @@ router = APIRouter()
 @router.post("/upload")
 async def upload_pdf(
     file: UploadFile = File(...),
-    thread_id: Optional[str] = Form(None)
+    thread_id: Optional[str] = Form(None),
+    current_user: dict = Depends(get_current_user)
+
 ):
     """
     Upload a PDF and ingest into Pinecone for RAG.
@@ -48,11 +51,21 @@ async def upload_pdf(
             thread_id=str(thread_id),
             filename=file.filename
         )
+        # Validate ingestion produced actual chunks
+        chunks = result.get("chunks", 0)
+        if chunks == 0:
+            raise HTTPException(
+                status_code=422,
+                detail="PDF was uploaded but no content could be extracted. "
+                       "Check if the PDF has selectable text (not a scanned image)."
+            )
+
 
         return {
             "status": "success",
             "message": "PDF ingested successfully",
             "thread_id": thread_id,
+            "ingested_by": current_user.get("username", current_user.get("sub")),
             "metadata": result,
         }
 
@@ -69,7 +82,8 @@ async def upload_pdf(
 @router.post("/ingest_url")
 async def ingest_url(
     url: str = Form(...),
-    thread_id: Optional[str] = Form(None)
+    thread_id: Optional[str] = Form(None),
+    current_user: dict = Depends(get_current_user)
 ):
     """Fetch webpage content, extract paragraphs, embed them, store in Pinecone."""
 
@@ -111,11 +125,18 @@ async def ingest_url(
             thread_id=str(thread_id),
             filename=url
         )
+        chunks = result.get("chunks", 0)
+        if chunks == 0:
+            raise HTTPException(
+                status_code=422,
+                detail="URL was fetched but no content could be indexed."
+            )
 
         return {
             "status": "success",
-            "message": "URL text ingested successfully",
+            "message": f"URL text ingested successfully({chunks} chunks indexed)",
             "thread_id": thread_id,
+            "ingested_by": current_user.get("username", current_user.get("sub")),
             "metadata": result,
         }
 

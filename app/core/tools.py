@@ -84,16 +84,19 @@ logger = logging.getLogger(__name__)
 # Helper: run async or sync safely
 # --------------------------------------------------
 def run_maybe_async(result):
-    """Run coroutine safely from sync context."""
-    if inspect.isawaitable(result):
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                return asyncio.run(result)
-            return loop.run_until_complete(result)
-        except RuntimeError:
-            return asyncio.new_event_loop().run_until_complete(result)
-    return result
+    """Run coroutine safely from sync or async context."""
+    if not inspect.isawaitable(result):
+        return result
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Already inside an async context — submit to the backend loop
+            from app.core.graph import submit_async_task
+            future = submit_async_task(result)
+            return future.result(timeout=30)
+        return loop.run_until_complete(result)
+    except RuntimeError:
+        return asyncio.new_event_loop().run_until_complete(result)
 
 
 # ==================================================

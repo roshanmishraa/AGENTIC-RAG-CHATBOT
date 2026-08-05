@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Request, HTTPException
+from app.auth.utils import get_current_user
 from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import APIRouter, Request, HTTPException, Depends
 from typing import Dict, Any, AsyncGenerator
 
 from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.tools import ToolMessage   # correct import
+from langchain_core.messages import ToolMessage   # correct import
 
 # FIXED IMPORT – correct module path
 from app.langgraph_mcp_backend import chatbot
@@ -65,7 +67,7 @@ async def _token_generator(payload: Dict[str, Any]) -> AsyncGenerator[str, None]
 #  STREAMING ENDPOINT  (Used by Streamlit)
 # =============================================================
 @router.post("/chat/stream")
-async def chat_stream(request: Request):
+async def chat_stream(request: Request, current_user: dict = Depends(get_current_user)):
     """
     Payload:
     {
@@ -106,7 +108,7 @@ async def chat_stream(request: Request):
 #  NON-STREAMING ENDPOINT (returns full reply)
 # =============================================================
 @router.post("/chat")
-async def chat_sync(body: Dict[str, Any]):
+async def chat_sync(body: Dict[str, Any],current_user: dict = Depends(get_current_user)):
     """
     Same functionality as streaming, but returns complete text.
     """

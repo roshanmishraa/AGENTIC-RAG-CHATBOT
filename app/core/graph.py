@@ -91,7 +91,7 @@ def get_llm():
         _llm = ChatOpenAI(
             model=settings.OPENAI_MODEL,
             api_key=settings.OPENAI_API_KEY,
-            temperature=0,
+            temperature=getattr(settings, "LLM_TEMPERATURE", 0),
         )
     return _llm
 
@@ -250,6 +250,10 @@ async def _build_graph():
 
 def get_compiled_chatbot():
     return run_async(_build_graph())
+
+async def warmup_graph_if_needed():
+    """Called on FastAPI startup to pre-compile the graph and checkpointer."""
+    await _build_graph()
 
 
 # =========================================================
