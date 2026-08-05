@@ -50,7 +50,7 @@ async def _call_with_retry(model, messages):
     return await model.ainvoke(messages)
 
 
-async def route_and_call(query: str, messages: list, force_complexity: QueryComplexity | None = None):
+async def route_and_call(query: str, messages: list, force_complexity: QueryComplexity | None = None, tools=None):
     """
     Main entrypoint used by graph.py.
     1. Picks OpenAI small/large model based on query complexity (cost-aware routing).
@@ -65,6 +65,8 @@ async def route_and_call(query: str, messages: list, force_complexity: QueryComp
 
     try:
         model = _build_openai(primary_model_name)
+        if tools:
+            model = model.bind_tools(tools)
         response = await _call_with_retry(model, messages)
         return response, primary_model_name
 
@@ -72,6 +74,8 @@ async def route_and_call(query: str, messages: list, force_complexity: QueryComp
         # Fallback: OpenAI down/rate-limited/quota-exceeded → try Google
         try:
             model = _build_google()
+            if tools:
+                model = model.bind_tools(tools)
             response = await _call_with_retry(model, messages)
             return response, f"{settings.GOOGLE_MODEL} (fallback, openai_error={type(openai_error).__name__})"
         except Exception as google_error:

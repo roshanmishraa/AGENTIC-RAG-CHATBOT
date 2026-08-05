@@ -15,28 +15,70 @@ from app.core.guardrails import check_input_safety, check_output_safety
 from app.core.tools import get_custom_tools
 from app.observability.tool_monitor import execute_tool_with_observability
 from app.observability.token_monitor import log_usage
+from app.core.services.vision_service import analyze_image
+from app.core.services.voice_service import speech_to_text, text_to_speech
 
 MAX_TOOL_LOOPS = 3
 
 
 class AgentState(TypedDict):
+
     chat_id: str
     user_id: str
+
     document_ids: list[str] | None
+
+    # User input
     query: str
+    input_type: str   # text | image | voice
+
+
+    # Vision
+    image_bytes: bytes | None
+    image_content_type: str | None
+    has_image: bool
+
+
+    # Voice
+    audio_bytes: bytes | None
+    transcript: str | None
+
+
+    # RAG
     rewritten_queries: list[str]
     retrieved_chunks: list[dict]
     needs_web_search: bool
-    messages: Annotated[list[BaseMessage], add_messages]   # ← the actual tool-calling conversation
+
+
+    # LangGraph conversation
+    messages: Annotated[
+        list[BaseMessage],
+        add_messages
+    ]
+
+
+    # Tools
     tool_loop_count: int
     tool_calls_made: list[dict]
+
+
+    # Response
     answer: str
     citations: list[dict]
+
     model_used: str
     tokens_used: int
     cost_usd: float
+
+
+    # Reflection
     reflection: dict
     needs_human_review: bool
+
+
+    # Voice output
+    generate_audio: bool
+    audio_response: bytes | None
 
 
 # ============================================================
@@ -50,6 +92,57 @@ async def node_guardrail_input(state: AgentState) -> dict:
                 "tokens_used": 0, "cost_usd": 0.0, "tool_calls_made": []}
     return {}
 
+async def node_detect_input_type(
+    state: AgentState
+):
+
+    if state.get("has_image"):
+        return {
+            "input_type":"image"
+        }
+
+    if state.get("audio_bytes"):
+        return {
+            "input_type":"voice"
+        }
+
+
+    return {
+        "input_type":"text"
+    }
+
+
+async def node_vision(
+    state: AgentState
+):
+
+    answer = await analyze_image(
+        image_bytes=state["image_bytes"],
+        question=state["query"],
+        content_type=state.get(
+            "image_content_type",
+            "image/jpeg"
+        )
+    )
+
+
+    return {
+        "answer":answer
+    }
+
+async def node_voice_to_text(
+    state: AgentState
+):
+
+    transcript = await speech_to_text(
+        state["audio_bytes"]
+    )
+
+
+    return {
+        "query": transcript,
+        "transcript": transcript
+    }
 
 async def node_rewrite(state: AgentState) -> dict:
     history = await get_short_term_memory(state["chat_id"])
@@ -104,8 +197,7 @@ def node_prepare_messages(state: AgentState) -> dict:
 # ============================================================
 async def node_chat(state: AgentState) -> dict:
     custom_tools = get_custom_tools()
-    mcp_tools = get_mcp_tools() if state["needs_web_search"] else []
-    all_tools = custom_tools + mcp_tools
+    all_tools = custom_tools 
 
     complexity = classify_complexity(state["query"])
     # Stop offering tools once we've hit the loop cap — forces a final answer
@@ -135,8 +227,7 @@ async def node_tools(state: AgentState) -> dict:
     from langchain_core.messages import ToolMessage
 
     custom_tools = get_custom_tools()
-    mcp_tools = get_mcp_tools() if state["needs_web_search"] else []
-    tools_by_name = {t.name: t for t in custom_tools + mcp_tools}
+    tools_by_name = {t.name: t for t in custom_tools }
 
     last_message = state["messages"][-1]
     tool_messages = []
@@ -213,39 +304,140 @@ def route_after_input_guardrail(state: AgentState) -> str:
     return "end" if state.get("model_used") == "blocked" else "continue"
 
 
+def route_input_type(state: AgentState):
+
+    input_type = state.get(
+        "input_type",
+        "text"
+    )
+
+    if input_type == "image":
+        return "vision"
+
+    if input_type == "voice":
+        return "voice"
+
+    return "text"
+
+
 # ============================================================
 # Build graph — tool loop is now REAL graph structure
 # ============================================================
 def build_graph():
+
     graph = StateGraph(AgentState)
 
+
     graph.add_node("guardrail_input", node_guardrail_input)
+
+    graph.add_node("detect_input", node_detect_input_type)
+
+    graph.add_node("vision", node_vision)
+
+    graph.add_node("voice_to_text", node_voice_to_text)
+
     graph.add_node("rewrite", node_rewrite)
+
     graph.add_node("retrieve", node_retrieve)
+
     graph.add_node("prepare_messages", node_prepare_messages)
+
     graph.add_node("chat", node_chat)
+
     graph.add_node("tools", node_tools)
+
     graph.add_node("finalize", node_finalize)
+
     graph.add_node("reflect", node_reflect)
+
     graph.add_node("guardrail_output", node_guardrail_output)
+
     graph.add_node("save_memory", node_save_memory)
 
-    graph.set_entry_point("guardrail_input")
-    graph.add_conditional_edges(
-        "guardrail_input", route_after_input_guardrail, {"end": END, "continue": "rewrite"}
+
+
+    graph.set_entry_point(
+        "guardrail_input"
     )
-    graph.add_edge("rewrite", "retrieve")
-    graph.add_edge("retrieve", "prepare_messages")
-    graph.add_edge("prepare_messages", "chat")
 
-    # ← THE ACTUAL TOOL-CALLING LOOP, as real edges:
-    graph.add_conditional_edges("chat", route_after_chat, {"tools": "tools", "finalize": "finalize"})
-    graph.add_edge("tools", "chat")   # loop back after executing tools
 
-    graph.add_edge("finalize", "reflect")
-    graph.add_edge("reflect", "guardrail_output")
-    graph.add_edge("guardrail_output", "save_memory")
-    graph.add_edge("save_memory", END)
+    graph.add_conditional_edges(
+        "guardrail_input",
+        route_after_input_guardrail,
+        {
+            "end":END,
+            "continue":"detect_input"
+        }
+    )
+
+
+    graph.add_conditional_edges(
+        "detect_input",
+        route_input_type,
+        {
+            "text":"rewrite",
+            "image":"vision",
+            "voice":"voice_to_text"
+        }
+    )
+
+
+    graph.add_edge("vision","finalize")
+
+    graph.add_edge(
+        "voice_to_text",
+        "rewrite"
+    )
+
+    graph.add_edge(
+        "rewrite",
+        "retrieve"
+    )
+
+    graph.add_edge(
+        "retrieve",
+        "prepare_messages"
+    )
+
+    graph.add_edge(
+        "prepare_messages",
+        "chat"
+    )
+
+    graph.add_conditional_edges(
+        "chat",
+        route_after_chat,
+        {
+            "tools":"tools",
+            "finalize":"finalize"
+        }
+    )
+
+    graph.add_edge(
+        "tools",
+        "chat"
+    )
+
+    graph.add_edge(
+        "finalize",
+        "reflect"
+    )
+
+    graph.add_edge(
+        "reflect",
+        "guardrail_output"
+    )
+
+    graph.add_edge(
+        "guardrail_output",
+        "save_memory"
+    )
+
+    graph.add_edge(
+        "save_memory",
+        END
+    )
+
 
     return graph
 

@@ -2,7 +2,7 @@ from langchain_core.tools import tool
 
 from openai import AsyncOpenAI
 
-from app.core.settings import settings
+from app.settings import settings
 
 
 

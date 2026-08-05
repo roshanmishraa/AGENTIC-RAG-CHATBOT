@@ -1,113 +1,64 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import ingest, chat, health, auth
-from app.core.mcp_tools import load_mcp_tools_safely
-from app.core.graph import ensure_backend_running, warmup_graph_if_needed
 from app.settings import settings
+from app.db.session import init_db
+from app.observability.logger import setup_logging, get_logger
+from app.observability.tracing import setup_langsmith_tracing
+
+from app.api.v1 import auth, admin, users, chat, ingest, health, eval, feedback, media
+
+logger = get_logger(__name__)
 
 
-# ============================================================
-# Initialize FastAPI Application
-# ============================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ---- Startup ----
+    setup_logging()
+    logger.info(f"Starting Agentic RAG Chatbot in {settings.APP_ENV} mode")
+
+    setup_langsmith_tracing()
+
+    await init_db()
+    logger.info("Database initialized (tables + pgvector extension ready)")
+
+    yield   # app runs here
+
+    # ---- Shutdown ----
+    logger.info("Shutting down Agentic RAG Chatbot backend")
+
 
 app = FastAPI(
-    title="Agentic RAG Chatbot (LangGraph + Pinecone + MCP)",
-    version="1.0.0",
+    title="Agentic RAG Chatbot",
+    version="2.0.0",
     description=(
-        "An agentic AI chatbot combining LangGraph, Pinecone RAG, "
-        "OpenAI tool-calling, MCP tools, and a Streamlit frontend."
+        "Production-grade agentic RAG chatbot: LangGraph tool-calling loop, "
+        "hybrid search + reranking, multi-provider LLM fallback, "
+        "security guardrails, and full observability."
     ),
-    contact={
-        "name": "Developer",
-        "email": "support@example.com"
-    },
+    lifespan=lifespan,
 )
-
-
-# ============================================================
-# CORS (IMPORTANT for Streamlit Frontend)
-# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # React dev servers
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ============================================================
-# API Routers
-# ============================================================
-
-app.include_router(ingest.router, prefix="/api/v1")
-app.include_router(chat.router, prefix="/api/v1")
-app.include_router(health.router, prefix="/api/v1")
 app.include_router(auth.router, prefix="/api/v1")
+app.include_router(users.router, prefix="/api/v1")
+app.include_router(admin.router, prefix="/api/v1")
+app.include_router(chat.router, prefix="/api/v1")
+app.include_router(media.router, prefix="/api/v1")
+app.include_router(ingest.router, prefix="/api/v1")
+app.include_router(health.router, prefix="/api/v1")
+app.include_router(eval.router, prefix="/api/v1")
+app.include_router(feedback.router, prefix="/api/v1")
 
-
-# ============================================================
-# Startup Event
-# ============================================================
-
-@app.on_event("startup")
-async def startup_event():
-    """
-    System startup handler.
-    Safely initializes:
-    - LangGraph backend loop
-    - LangGraph compiled graph + checkpointer
-    - MCP tools
-    - Embedding models (lazy)
-    """
-    print("🚀 Starting Agentic RAG Chatbot backend...")
-
-    # 1) Start LangGraph backend loop
-    ensure_backend_running()
-    print("🔧 LangGraph backend event loop started.")
-
-    # 2) Warm up graph (compile + checkpointer init)
-    try:
-        await warmup_graph_if_needed()
-        print("⚡ LangGraph compiled & checkpointer ready.")
-    except Exception as exc:
-        print(f"⚠️ Graph warmup failed: {exc}")
-
-    # 3) Load MCP tools AFTER backend is running
-    try:
-        load_mcp_tools_safely()
-        print("🔧 MCP tools loaded successfully.")
-    except Exception as exc:
-        print(f"⚠️ MCP tools failed to load: {exc}")
-
-    print("Backend initialized and ready for requests.")
-
-
-# ============================================================
-# Shutdown Event
-# ============================================================
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """
-    Graceful shutdown.
-    NOTE: LangGraph backend loop is daemon-thread-based,
-    so it terminates automatically when process ends.
-    """
-    print("🛑 Shutting down Agentic RAG Chatbot backend...")
-
-
-# ============================================================
-# Local Dev Runner
-# ============================================================
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "app.main:app",
-        host=settings.HOST,
-        port=settings.PORT,
-        reload=True
-    )
+    uvicorn.run("app.main:app", host=settings.HOST, port=settings.PORT, reload=True)
