@@ -1,15 +1,9 @@
+# app/core/reflection.py
+
 from __future__ import annotations
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
 import json
 
 from app.settings import settings
-
-_reflection_model = ChatOpenAI(
-    api_key=settings.OPENAI_API_KEY,
-    model=settings.OPENAI_MODEL_SMALL,
-    temperature=0,
-)
 
 REFLECTION_PROMPT = """You are a strict fact-checker reviewing an AI-generated answer against the source context it was supposed to be based on.
 
@@ -23,29 +17,63 @@ Return ONLY JSON in this exact format:
 """
 
 
+def _get_reflection_model():
+    """
+    Lazy init — created on first call, not at import time.
+    Module-level init crashes at startup if OPENAI_API_KEY
+    is missing (CI, testing, Docker build without secrets).
+    """
+    from langchain_openai import ChatOpenAI
+    return ChatOpenAI(
+        api_key=settings.OPENAI_API_KEY,
+        model=settings.OPENAI_MODEL_SMALL,
+        temperature=0,
+    )
+
+
 async def reflect_on_answer(question: str, context: str, answer: str) -> dict:
     """
-    Self-critique step — runs AFTER an answer is generated, BEFORE it's sent to the user.
-    Returns a verdict the graph can use to decide: send answer as-is, regenerate, or
-    add a disclaimer / route to human review.
+    Self-critique step — runs AFTER answer is generated, BEFORE sent to user.
+    Returns a verdict the graph uses to decide: send as-is, add disclaimer,
+    or route to human review.
     """
-    messages = [
-        SystemMessage(content=REFLECTION_PROMPT),
-        HumanMessage(content=(
-            f"Question: {question}\n\n"
-            f"Context provided to the model:\n{context}\n\n"
-            f"Generated answer:\n{answer}"
-        )),
+    messages_payload = [
+        {"role": "system", "content": REFLECTION_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Question: {question}\n\n"
+                f"Context provided to the model:\n{context}\n\n"
+                f"Generated answer:\n{answer}"
+            ),
+        },
     ]
 
     try:
-        response = await _reflection_model.ainvoke(messages)
+        from langchain_core.messages import SystemMessage, HumanMessage
+        model = _get_reflection_model()             # ← lazy, only runs when called
+        response = await model.ainvoke([
+            SystemMessage(content=REFLECTION_PROMPT),
+            HumanMessage(content=(
+                f"Question: {question}\n\n"
+                f"Context provided to the model:\n{context}\n\n"
+                f"Generated answer:\n{answer}"
+            )),
+        ])
         verdict = json.loads(response.content)
+
+        # Validate each field explicitly — LLM may return partial JSON
         return {
-            "is_grounded": verdict.get("is_grounded", True),
-            "issues": verdict.get("issues", []),
+            "is_grounded": bool(verdict.get("is_grounded", True)),
+            "issues": verdict.get("issues", []) if isinstance(verdict.get("issues"), list) else [],
             "confidence": float(verdict.get("confidence", 0.5)),
         }
+
     except Exception:
-        # If reflection itself fails, don't block the answer — just mark as unverified
-        return {"is_grounded": True, "issues": ["reflection_check_failed"], "confidence": 0.5}
+        # Reflection failing must never block the answer from reaching the user.
+        # Mark as unverified and let node_reflect decide based on confidence threshold.
+        return {
+            "is_grounded": True,
+            "issues": ["reflection_check_failed"],
+            "confidence": 0.5,
+        }

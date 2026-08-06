@@ -1,7 +1,12 @@
+# app/api/v1/eval.py
+
+import asyncio
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
+
 from app.security.rbac import get_current_user
+from app.db.models import User
 
 router = APIRouter()
 
@@ -9,14 +14,14 @@ router = APIRouter()
 class RAGASEvalRequest(BaseModel):
     questions: List[str]
     answers: List[str]
-    contexts: List[List[str]]          # for each question, list of retrieved chunk texts
-    ground_truths: Optional[List[str]] = None   # optional reference answers
+    contexts: List[List[str]]
+    ground_truths: Optional[List[str]] = None
 
 
 @router.post("/eval/rag")
 async def evaluate_rag(
     body: RAGASEvalRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),  # ← was dict, is ORM object
 ):
     """
     Evaluate RAG quality using RAGAS metrics.
@@ -35,10 +40,19 @@ async def evaluate_rag(
         "ground_truths": ["X is indeed ..."]
     }
     """
-    if len(body.questions) != len(body.answers) or len(body.questions) != len(body.contexts):
+    if (
+        len(body.questions) != len(body.answers)
+        or len(body.questions) != len(body.contexts)
+    ):
         raise HTTPException(
             status_code=400,
-            detail="questions, answers, and contexts must all have the same length"
+            detail="questions, answers, and contexts must all have the same length",
+        )
+
+    if body.ground_truths and len(body.ground_truths) != len(body.questions):
+        raise HTTPException(
+            status_code=400,
+            detail="ground_truths length must match questions length",
         )
 
     try:
@@ -55,22 +69,25 @@ async def evaluate_rag(
         }
 
         if body.ground_truths:
-            if len(body.ground_truths) != len(body.questions):
-                raise HTTPException(
-                    status_code=400,
-                    detail="ground_truths length must match questions length"
-                )
             from ragas.metrics import context_recall
             data["ground_truth"] = body.ground_truths
             metrics.append(context_recall)
 
         dataset = Dataset.from_dict(data)
-        result = evaluate(dataset, metrics=metrics)
+
+        # RAGAS evaluate() is a synchronous, CPU+IO bound call.
+        # Running it directly inside an async endpoint blocks the entire
+        # FastAPI event loop for the full duration of the evaluation —
+        # no other requests can be served during that time.
+        # asyncio.to_thread() offloads it to a thread pool so the event
+        # loop stays free to handle other requests while RAGAS runs.
+        result = await asyncio.to_thread(evaluate, dataset, metrics=metrics)
+
         scores = result.to_pandas().mean().to_dict()
 
         return {
             "status": "success",
-            "evaluated_by": current_user.get("username"),
+            "evaluated_by": current_user.username,   # ← was current_user.get("username")
             "sample_count": len(body.questions),
             "metrics": scores,
             "has_ground_truths": bool(body.ground_truths),
@@ -79,7 +96,7 @@ async def evaluate_rag(
     except ImportError:
         raise HTTPException(
             status_code=501,
-            detail="RAGAS not installed. Run: pip install ragas datasets"
+            detail="RAGAS not installed. Run: pip install ragas datasets",
         )
     except HTTPException:
         raise

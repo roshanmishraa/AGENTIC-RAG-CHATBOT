@@ -1,17 +1,18 @@
+# app/db/vectorstore.py
+
 from __future__ import annotations
 from typing import Optional
 import uuid
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from openai import AsyncOpenAI
 
 from app.settings import settings
-from app.db.models import DocumentChunk
+from app.db.models import DocumentChunk, Document
 
 openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
-# Pinecone is optional — only imported/initialized if that backend is selected
 _pinecone_index = None
 
 
@@ -25,7 +26,6 @@ def _get_pinecone_index():
 
 
 async def embed_text(text_input: str) -> list[float]:
-    """Single embedding call — used for both ingestion and query time."""
     response = await openai_client.embeddings.create(
         model=settings.EMBEDDING_MODEL,
         input=text_input,
@@ -34,7 +34,6 @@ async def embed_text(text_input: str) -> list[float]:
 
 
 async def embed_batch(texts: list[str]) -> list[list[float]]:
-    """Batch embedding — much cheaper/faster than one-by-one during ingestion."""
     response = await openai_client.embeddings.create(
         model=settings.EMBEDDING_MODEL,
         input=texts,
@@ -43,13 +42,9 @@ async def embed_batch(texts: list[str]) -> list[list[float]]:
 
 
 # ============================================================
-# Insert (used during document ingestion)
+# Insert
 # ============================================================
 async def upsert_chunks(db: AsyncSession, document_id: str, chunks: list[dict]):
-    """
-    chunks = [{"content": str, "chunk_index": int, "page_number": int|None}, ...]
-    Embeds all chunks in one batch call, then writes to the selected backend.
-    """
     texts = [c["content"] for c in chunks]
     embeddings = await embed_batch(texts)
 
@@ -80,36 +75,55 @@ async def upsert_chunks(db: AsyncSession, document_id: str, chunks: list[dict]):
             for c, emb in zip(chunks, embeddings)
         ]
         index.upsert(vectors=vectors)
-        # Still store a lightweight row in Postgres for admin/history visibility
         for c in chunks:
             db.add(DocumentChunk(
                 document_id=document_id,
                 chunk_index=c["chunk_index"],
                 content=c["content"],
-                embedding=[0.0] * 1536,   # placeholder, actual vector lives in Pinecone
+                embedding=[0.0] * 1536,
                 page_number=c.get("page_number"),
             ))
         await db.commit()
 
 
 # ============================================================
-# Similarity search (used at query time)
+# Similarity search
 # ============================================================
-async def vector_search(db: AsyncSession, query: str, top_k: int, document_ids: Optional[list[str]] = None):
+async def vector_search(
+    db: AsyncSession,
+    query: str,
+    top_k: int,
+    document_ids: Optional[list[str]] = None,
+    owner_id: Optional[str] = None,            # ← ADDED
+) -> list[dict]:
     query_embedding = await embed_text(query)
 
     if settings.VECTOR_BACKEND == "pgvector":
-        # <=> is pgvector's cosine distance operator; smaller = more similar
+
         stmt = (
             select(
                 DocumentChunk,
                 DocumentChunk.embedding.cosine_distance(query_embedding).label("distance"),
             )
-            .order_by("distance")
-            .limit(top_k)
+            # JOIN Document so we can filter by owner_id
+            .join(Document, DocumentChunk.document_id == Document.id)
         )
+
+        # ── Security boundary — ALWAYS applied when owner_id is provided ──
+        # This ensures a user can never retrieve another user's chunks,
+        # even if they somehow know the document_id.
+        if owner_id:
+            stmt = stmt.where(Document.owner_id == owner_id)
+
+        # ── Optional UX scope — narrow to specific documents ──
+        # Sits on top of the owner filter, never replaces it.
         if document_ids:
             stmt = stmt.where(DocumentChunk.document_id.in_(document_ids))
+
+        # ORDER and LIMIT come LAST — after all WHERE clauses are applied.
+        # The old code had .where() after .limit() which caused Postgres
+        # to limit BEFORE filtering, returning wrong or insufficient results.
+        stmt = stmt.order_by("distance").limit(top_k)
 
         result = await db.execute(stmt)
         rows = result.all()
@@ -119,15 +133,28 @@ async def vector_search(db: AsyncSession, query: str, top_k: int, document_ids: 
                 "document_id": chunk.document_id,
                 "page_number": chunk.page_number,
                 "chunk_index": chunk.chunk_index,
-                "score": 1 - distance,   # convert distance → similarity score
+                "score": 1 - distance,
             }
             for chunk, distance in rows
         ]
 
     elif settings.VECTOR_BACKEND == "pinecone":
         index = _get_pinecone_index()
-        filter_ = {"document_id": {"$in": document_ids}} if document_ids else None
-        results = index.query(vector=query_embedding, top_k=top_k, include_metadata=True, filter=filter_)
+
+        # Pinecone filter — owner_id is the primary boundary,
+        # document_ids narrows further if provided.
+        filter_: dict = {}
+        if owner_id:
+            filter_["owner_id"] = {"$eq": owner_id}
+        if document_ids:
+            filter_["document_id"] = {"$in": document_ids}
+
+        results = index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            include_metadata=True,
+            filter=filter_ if filter_ else None,
+        )
         return [
             {
                 "content": match["metadata"]["content"],

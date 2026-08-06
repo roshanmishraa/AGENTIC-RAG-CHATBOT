@@ -1,4 +1,4 @@
-import random
+import secrets    
 import redis.asyncio as redis
 
 from app.settings import settings

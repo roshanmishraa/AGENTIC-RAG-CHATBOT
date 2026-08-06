@@ -6,10 +6,14 @@ from app.settings import settings
 from app.db.session import init_db
 from app.observability.logger import setup_logging, get_logger
 from app.observability.tracing import setup_langsmith_tracing
+# app/main.py  — only the lifespan block changes
+
+from app.core.graph import init_graph, get_compiled_graph   # ← updated import
 
 from app.api.v1 import auth, admin, users, chat, ingest, health, eval, feedback, media
 
 logger = get_logger(__name__)
+
 
 
 @asynccontextmanager
@@ -17,16 +21,16 @@ async def lifespan(app: FastAPI):
     # ---- Startup ----
     setup_logging()
     logger.info(f"Starting Agentic RAG Chatbot in {settings.APP_ENV} mode")
-
     setup_langsmith_tracing()
-
     await init_db()
-    logger.info("Database initialized (tables + pgvector extension ready)")
+    logger.info("Database initialized")
+    await init_graph()                                        # ← ADD THIS
+    logger.info("LangGraph compiled and checkpointer ready")
 
-    yield   # app runs here
+    yield
 
     # ---- Shutdown ----
-    logger.info("Shutting down Agentic RAG Chatbot backend")
+    logger.info("Shutting down")
 
 
 app = FastAPI(
