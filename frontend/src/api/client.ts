@@ -1,34 +1,382 @@
 import axios from "axios";
 import { useAuthStore } from "../store/authStore";
 
+const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api/v1";
+
+
 export const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || "http://localhost:8000/api/v1",
+  baseURL: BASE
 });
 
-// Attach JWT to every outgoing request automatically
+
+// ── Attach JWT automatically ──────────────────────────────
 api.interceptors.request.use((config) => {
+
   const token = useAuthStore.getState().accessToken;
-  if (token) config.headers.Authorization = `Bearer ${token}`;
+
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+
   return config;
+
 });
 
-// Auto-refresh token on 401, retry original request once
+
+// ── Auto-refresh on 401 ───────────────────────────────────
 api.interceptors.response.use(
-  (response) => response,
-  async (error) => {
-    const originalRequest = error.config;
-    if (error.response?.status === 401 && !originalRequest._retry) {
-      originalRequest._retry = true;
+
+  (r) => r,
+
+  async (err) => {
+
+    const orig = err.config;
+
+
+    if (
+      err.response?.status === 401 &&
+      !orig._retry
+    ) {
+
+      orig._retry = true;
+
+
       try {
-        const refreshToken = useAuthStore.getState().refreshToken;
-        const { data } = await axios.post(`${api.defaults.baseURL}/auth/refresh`, { refresh_token: refreshToken });
-        useAuthStore.getState().setTokens(data.access_token, data.refresh_token);
-        originalRequest.headers.Authorization = `Bearer ${data.access_token}`;
-        return api(originalRequest);
+
+        const rt =
+          useAuthStore.getState().refreshToken;
+
+
+        const { data } =
+          await axios.post(
+            `${BASE}/auth/refresh`,
+            {
+              refresh_token: rt,
+            }
+          );
+
+
+        useAuthStore
+          .getState()
+          .setTokens(
+            data.access_token,
+            data.refresh_token
+          );
+
+
+        orig.headers.Authorization =
+          `Bearer ${data.access_token}`;
+
+
+        return api(orig);
+
+
       } catch {
-        useAuthStore.getState().logout();
+
+        useAuthStore
+          .getState()
+          .logout();
+
       }
+
     }
-    return Promise.reject(error);
+
+
+    return Promise.reject(err);
+
   }
+
 );
+
+
+// ── Typed API helpers ─────────────────────────────────────
+
+export const authAPI = {
+
+  signup: (
+    email: string,
+    username: string,
+    password: string
+  ) =>
+    api.post(
+      "/auth/signup",
+      {
+        email,
+        username,
+        password
+      }
+    ),
+
+
+  login: (
+    email: string,
+    password: string
+  ) =>
+    api.post(
+      "/auth/login",
+      {
+        email,
+        password
+      }
+    ),
+
+
+  logout: (
+    refreshToken: string
+  ) =>
+    api.post(
+      "/auth/logout",
+      {
+        refresh_token: refreshToken
+      }
+    ),
+
+
+  me: () =>
+    api.get(
+      "/users/me"
+    ),
+
+};
+
+
+
+export const chatAPI = {
+
+  sendMessage: (
+    chatId: string,
+    query: string,
+    documentIds?: string[]
+  ) =>
+    api.post(
+      "/chat/message",
+      {
+        chat_id: chatId,
+
+        query,
+
+        document_ids:
+          documentIds?.length
+            ? documentIds
+            : undefined,
+      }
+    ),
+
+};
+
+
+
+export const ingestAPI = {
+
+  uploadDocument: (
+    file: File
+  ) => {
+
+    const fd = new FormData();
+
+    fd.append(
+      "file",
+      file
+    );
+
+
+    return api.post(
+      "/ingest/upload",
+      fd,
+      {
+        headers: {
+          "Content-Type":
+            "multipart/form-data",
+        },
+      }
+    );
+
+  },
+
+
+  listDocuments: () =>
+    api.get(
+      "/ingest/documents"
+    ),
+
+};
+
+
+
+export const mediaAPI = {
+
+
+  analyzeImage: (
+    imageFile: File,
+    question = "Describe this image."
+  ) => {
+
+    const fd = new FormData();
+
+    fd.append(
+      "image",
+      imageFile
+    );
+
+    fd.append(
+      "question",
+      question
+    );
+
+
+    return api.post(
+      "/media/vision",
+      fd,
+      {
+        headers: {
+          "Content-Type":
+            "multipart/form-data",
+        },
+      }
+    );
+
+  },
+
+
+  transcribeVoice: (
+    blob: Blob
+  ) => {
+
+    const fd = new FormData();
+
+    fd.append(
+      "audio",
+      blob,
+      "recording.webm"
+    );
+
+
+    return api.post(
+      "/media/voice/transcribe",
+      fd,
+      {
+        headers: {
+          "Content-Type":
+            "multipart/form-data",
+        },
+      }
+    );
+
+  },
+
+
+  speak: (
+    text: string,
+    voice = "alloy"
+  ) =>
+    api.post(
+      "/media/voice/speak",
+      {
+        text,
+        voice
+      },
+      {
+        responseType: "blob"
+      }
+    ),
+
+};
+
+
+
+export const feedbackAPI = {
+
+  submit: (
+    messageId: string,
+    rating: -1 | 0 | 1,
+    comment?: string
+  ) =>
+    api.post(
+      "/feedback",
+      {
+        message_id: messageId,
+        rating,
+        comment
+      }
+    ),
+
+};
+
+
+
+export const adminAPI = {
+
+  usage: () =>
+    api.get(
+      "/admin/usage"
+    ),
+
+
+  users: (
+    limit = 50,
+    offset = 0
+  ) =>
+    api.get(
+      `/admin/users?limit=${limit}&offset=${offset}`
+    ),
+
+
+  deactivateUser: (
+    userId: string
+  ) =>
+    api.patch(
+      `/admin/users/${userId}/deactivate`
+    ),
+
+
+  auditLogs: (
+    limit = 50,
+    offset = 0
+  ) =>
+    api.get(
+      `/admin/audit-logs?limit=${limit}&offset=${offset}`
+    ),
+
+};
+
+
+
+export const healthAPI = {
+
+  live: () =>
+    api.get(
+      "/health/live"
+    ),
+
+
+  ready: () =>
+    api.get(
+      "/health/ready"
+    ),
+
+};
+
+
+
+export const evalAPI = {
+
+  evaluate: (
+    questions: string[],
+    answers: string[],
+    contexts: string[][],
+    groundTruths?: string[]
+  ) =>
+    api.post(
+      "/eval/rag",
+      {
+        questions,
+        answers,
+        contexts,
+        ground_truths: groundTruths
+      }
+    ),
+
+};
+
+
+export { BASE };
