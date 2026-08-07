@@ -8,7 +8,7 @@ from app.observability.logger import setup_logging, get_logger
 from app.observability.tracing import setup_langsmith_tracing
 # app/main.py  — only the lifespan block changes
 
-from app.core.graph import init_graph, get_compiled_graph   # ← updated import
+from app.core.graph import init_graph,close_graph, get_compiled_graph   # ← updated import
 
 from app.api.v1 import auth, admin, users, chat, ingest, health, eval, feedback, media
 
@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
 
     # ---- Shutdown ----
     logger.info("Shutting down")
-
+    await close_graph()
 
 app = FastAPI(
     title="Agentic RAG Chatbot",

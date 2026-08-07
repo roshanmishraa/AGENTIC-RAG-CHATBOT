@@ -14,7 +14,10 @@ from app.core.reflection import reflect_on_answer
 from app.core.model_router import route_and_call, estimate_cost, classify_complexity
 from app.core.memory import get_short_term_memory, append_short_term_memory, load_history_from_db
 from app.core.guardrails import check_input_safety, check_output_safety
-from app.core.tools import get_custom_tools
+from app.core.tools.rag_tool import make_rag_tool          # ← factory, not singleton
+from app.core.tools.search_tool import web_search_tool
+from app.core.tools.calculator_tool import calculator_tool
+from app.core.tools.summary_tool import summary_tool
 from app.observability.tool_monitor import execute_tool_with_observability
 from app.observability.token_monitor import log_usage
 from app.core.services.vision_service import analyze_image
@@ -22,16 +25,28 @@ from app.core.services.voice_service import speech_to_text
 
 MAX_TOOL_LOOPS = 3
 
-# ============================================================
-# Compiled graph singleton — built ONCE at startup, reused forever.
-# The old pattern (async with ... return inside) closed the
-# checkpointer connection the moment the function returned,
-# so every graph.ainvoke() was hitting a dead connection.
-# ============================================================
 _compiled_graph = None
 _checkpointer = None
+_checkpointer_cm = None 
 
 
+# ============================================================
+# Scoped tool builder — called per-request, NOT at import time.
+# owner_id is the hard security boundary (never sees other users' docs).
+# document_ids is optional UX narrowing on top of that.
+# ============================================================
+def get_scoped_tools(user_id: str, document_ids: list[str] | None) -> list:
+    return [
+        make_rag_tool(owner_id=user_id, document_ids=document_ids),
+        web_search_tool,
+        calculator_tool,
+        summary_tool,
+    ]
+
+
+# ============================================================
+# State
+# ============================================================
 class AgentState(TypedDict):
 
     chat_id: str
@@ -86,8 +101,6 @@ class AgentState(TypedDict):
 async def node_guardrail_input(state: AgentState) -> dict:
     safety = await check_input_safety(state["query"])
     if not safety["is_safe"]:
-        # Return full state so downstream reads never KeyError,
-        # even though route_after_input_guardrail sends us to END.
         return {
             "answer": "I can't help with that request.",
             "needs_human_review": False,
@@ -120,12 +133,13 @@ async def node_vision(state: AgentState) -> dict:
         question=state["query"],
         content_type=state.get("image_content_type", "image/jpeg"),
     )
-    # Vision bypasses retrieval — seed empty chunks so finalize never KeyErrors.
+    # Vision bypasses retrieval — seed all required fields so
+    # node_finalize never hits a KeyError.
     return {
         "answer": answer,
         "retrieved_chunks": [],
         "citations": [],
-        "messages": [HumanMessage(content=answer)],  # finalize reads messages[-1].content
+        "messages": [HumanMessage(content=answer)],
         "model_used": "gpt-4o-mini (vision)",
         "tokens_used": 0,
         "cost_usd": 0.0,
@@ -142,7 +156,7 @@ async def node_voice_to_text(state: AgentState) -> dict:
 
 
 async def node_rewrite(state: AgentState) -> dict:
-    # Cold-start fallback: if Redis cache is empty, rebuild from Postgres
+    # Cold-start fallback: Redis empty → rebuild from Postgres
     history = await get_short_term_memory(state["chat_id"])
     if not history:
         from app.db.session import AsyncSessionLocal
@@ -158,7 +172,11 @@ async def node_retrieve(state: AgentState) -> dict:
     all_chunks = []
     async with AsyncSessionLocal() as db:
         for q in state["rewritten_queries"]:
-            chunks = await retrieve(db, q, document_ids=state.get("document_ids"))
+            chunks = await retrieve(
+                db, q,
+                document_ids=state.get("document_ids"),
+                owner_id=state["user_id"],          # ← ownership scope
+            )
             all_chunks.extend(chunks)
 
     # Deduplicate by (document_id, chunk_index)
@@ -179,7 +197,6 @@ async def node_retrieve(state: AgentState) -> dict:
 
 
 def node_prepare_messages(state: AgentState) -> dict:
-    """Builds the system + human message that starts the chat/tool loop."""
     context_text = "\n\n".join(
         f"[Source {i+1}] {c['content']}"
         for i, c in enumerate(state["retrieved_chunks"])
@@ -202,17 +219,21 @@ def node_prepare_messages(state: AgentState) -> dict:
 
 
 # ============================================================
-# CHAT NODE — calls LLM (with tools bound if under loop cap)
+# CHAT NODE
 # ============================================================
 async def node_chat(state: AgentState) -> dict:
-    custom_tools = get_custom_tools()
+    # Build scoped tools per-request — rag_tool is scoped to this
+    # user's documents only. Never shared across users or requests.
+    all_tools = get_scoped_tools(
+        user_id=state["user_id"],
+        document_ids=state.get("document_ids"),
+    )
     complexity = classify_complexity(state["query"])
 
-    # Once loop cap is reached, stop binding tools so the LLM
-    # is forced to produce a final text answer, not another tool call.
+    # Stop binding tools at the loop cap — forces a final text answer
     bind_tools = (
-        custom_tools
-        if (custom_tools and state["tool_loop_count"] < MAX_TOOL_LOOPS)
+        all_tools
+        if (all_tools and state["tool_loop_count"] < MAX_TOOL_LOOPS)
         else None
     )
 
@@ -236,12 +257,21 @@ async def node_chat(state: AgentState) -> dict:
 
 
 # ============================================================
-# TOOLS NODE — executes tool calls, wrapped with observability
+# TOOLS NODE
 # ============================================================
 async def node_tools(state: AgentState) -> dict:
     from langchain_core.messages import ToolMessage
 
-    tools_by_name = {t.name: t for t in get_custom_tools()}
+    # Rebuild scoped tools here too — must match what node_chat bound.
+    # Both nodes use get_scoped_tools() so the tool registry is always
+    # consistent for this user + document scope.
+    tools_by_name = {
+        t.name: t for t in get_scoped_tools(
+            user_id=state["user_id"],
+            document_ids=state.get("document_ids"),
+        )
+    }
+
     last_message = state["messages"][-1]
     tool_messages = []
     calls_log = list(state.get("tool_calls_made", []))
@@ -250,7 +280,6 @@ async def node_tools(state: AgentState) -> dict:
         tool_obj = tools_by_name.get(tc["name"])
 
         if not tool_obj:
-            # Unknown tool — log it and return a clean error ToolMessage
             result = {
                 "tool_call_id": tc["id"],
                 "tool_name": tc["name"],
@@ -259,8 +288,7 @@ async def node_tools(state: AgentState) -> dict:
                 "duration_ms": 0,
             }
         else:
-            # execute_tool_with_observability handles timing + structured logging.
-            # It also records as a child span in LangSmith automatically.
+            # Handles timing, structured logging, and LangSmith child span.
             result = await execute_tool_with_observability(tool_obj, tc)
 
         calls_log.append(result)
@@ -294,8 +322,6 @@ def route_input_type(state: AgentState) -> str:
 def route_after_chat(state: AgentState) -> str:
     last_message = state["messages"][-1]
     has_tool_calls = bool(getattr(last_message, "tool_calls", None))
-    # Only route to tools if the LLM actually made calls AND we're under the cap.
-    # node_chat already stops binding tools at the cap, so this is a safety net.
     if has_tool_calls and state["tool_loop_count"] < MAX_TOOL_LOOPS:
         return "tools"
     return "finalize"
@@ -305,11 +331,7 @@ def route_after_chat(state: AgentState) -> str:
 # Remaining nodes
 # ============================================================
 async def node_finalize(state: AgentState) -> dict:
-    """Extracts the final answer + citations once the chat/tools loop ends."""
-    # state["messages"][-1] is always set — vision path seeds a HumanMessage,
-    # text/voice path ends with the last LLM response.
     final_answer = state["messages"][-1].content
-
     citations = [
         {
             "document_id": c["document_id"],
@@ -318,24 +340,20 @@ async def node_finalize(state: AgentState) -> dict:
         }
         for c in state.get("retrieved_chunks", [])
     ]
-
     await log_usage(
         state["chat_id"], state["user_id"],
         state["model_used"], state["tokens_used"], state["cost_usd"],
     )
-
     return {"answer": final_answer, "citations": citations}
 
 
 async def node_reflect(state: AgentState) -> dict:
     context_text = "\n\n".join(c["content"] for c in state.get("retrieved_chunks", []))
     verdict = await reflect_on_answer(state["query"], context_text, state["answer"])
-
     needs_review = not verdict["is_grounded"] or verdict["confidence"] < 0.4
     answer = state["answer"]
     if needs_review:
         answer += "\n\n*Note: This answer may need verification — flagged for review.*"
-
     return {"reflection": verdict, "needs_human_review": needs_review, "answer": answer}
 
 
@@ -381,10 +399,10 @@ def build_graph() -> StateGraph:
         {"text": "rewrite", "image": "vision", "voice": "voice_to_text"},
     )
 
-    graph.add_edge("vision",        "finalize")
-    graph.add_edge("voice_to_text", "rewrite")
-    graph.add_edge("rewrite",       "retrieve")
-    graph.add_edge("retrieve",      "prepare_messages")
+    graph.add_edge("vision",           "finalize")
+    graph.add_edge("voice_to_text",    "rewrite")
+    graph.add_edge("rewrite",          "retrieve")
+    graph.add_edge("retrieve",         "prepare_messages")
     graph.add_edge("prepare_messages", "chat")
 
     graph.add_conditional_edges(
@@ -402,30 +420,36 @@ def build_graph() -> StateGraph:
 
 
 # ============================================================
-# Startup: compile once, keep the checkpointer connection alive.
-# Called from main.py lifespan — NOT from chat.py per-request.
+# Startup init — called ONCE from main.py lifespan
 # ============================================================
 async def init_graph():
     """
     Call this ONCE in the FastAPI lifespan startup block.
-    Keeps the AsyncPostgresSaver connection open for the life
-    of the process — solves the closed-connection bug where
-    the old 'async with ... return' pattern destroyed the
-    checkpointer the moment get_compiled_graph() returned.
+
+    AsyncPostgresSaver.from_conn_string() is an async context manager,
+    not a constructor — it must be entered manually via __aenter__() to
+    get a real checkpointer instance, and kept open for the life of the
+    process. Call close_graph() at shutdown to release it cleanly.
     """
-    global _compiled_graph, _checkpointer
+    global _compiled_graph, _checkpointer, _checkpointer_cm
 
     conn_str = settings.DATABASE_URL.replace("+asyncpg", "")
-    _checkpointer = AsyncPostgresSaver.from_conn_string(conn_str)
+    _checkpointer_cm = AsyncPostgresSaver.from_conn_string(conn_str)
+    _checkpointer = await _checkpointer_cm.__aenter__()
     await _checkpointer.setup()
     _compiled_graph = build_graph().compile(checkpointer=_checkpointer)
 
 
+async def close_graph():
+    """
+    Call this from the FastAPI lifespan SHUTDOWN block.
+    Cleanly exits the checkpointer's connection pool.
+    """
+    global _checkpointer_cm
+    if _checkpointer_cm is not None:
+        await _checkpointer_cm.__aexit__(None, None, None)
+
 def get_compiled_graph():
-    """
-    Called by chat.py on every request — returns the already-compiled
-    singleton. Raises clearly if init_graph() was never called at startup.
-    """
     if _compiled_graph is None:
         raise RuntimeError(
             "Graph not initialized. Call await init_graph() in the FastAPI lifespan startup."

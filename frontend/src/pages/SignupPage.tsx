@@ -4,7 +4,7 @@ import { api } from "../api/client";
 import { useAuthStore } from "../store/authStore";
 
 export default function SignupPage() {
-  const [form, setForm] = useState({ email: "", password: "", full_name: "", phone_number: "" });
+  const [form, setForm] = useState({ email: "", username: "", password: "", full_name: "", phone_number: "" });
   const [error, setError] = useState("");
   const navigate = useNavigate();
   const { setTokens, setUser } = useAuthStore();
@@ -31,6 +31,8 @@ export default function SignupPage() {
           onChange={(e) => setForm({ ...form, full_name: e.target.value })} />
         <input className="w-full border rounded-lg px-3 py-2" placeholder="Email"
           onChange={(e) => setForm({ ...form, email: e.target.value })} />
+        <input className="w-full border rounded-lg px-3 py-2" placeholder="Username"
+          onChange={(e) => setForm({ ...form, username: e.target.value })} />
         <input className="w-full border rounded-lg px-3 py-2" placeholder="Phone number (optional)"
           onChange={(e) => setForm({ ...form, phone_number: e.target.value })} />
         <input type="password" className="w-full border rounded-lg px-3 py-2" placeholder="Password"
