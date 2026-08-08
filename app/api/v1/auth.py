@@ -62,13 +62,19 @@ class UserResponse(BaseModel):
     username: str
 
 
-@router.post("/signup", response_model=UserResponse, status_code=201)
+
+@router.post("/signup", response_model=TokenResponse, status_code=201)
 async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
     try:
         user = await create_user(db, body.email, body.username, body.password)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
-    return UserResponse(id=user.id, email=user.email, username=user.username)
+    
+    token_data = {"sub": user.id, "username": user.username}
+    return TokenResponse(
+        access_token=create_access_token(token_data),
+        refresh_token=create_refresh_token(token_data),
+    )
 
 
 @router.post("/login", response_model=TokenResponse)

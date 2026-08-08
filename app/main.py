@@ -19,6 +19,11 @@ logger = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ---- Startup ----
+    if settings.SECRET_KEY == "change-me-in-production":
+        raise RuntimeError(
+            "SECRET_KEY is still the default value. "
+            "Set a secure random value in your .env file."
+        )
     setup_logging()
     logger.info(f"Starting Agentic RAG Chatbot in {settings.APP_ENV} mode")
     setup_langsmith_tracing()

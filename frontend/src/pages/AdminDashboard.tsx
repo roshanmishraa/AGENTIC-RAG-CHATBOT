@@ -8,8 +8,8 @@ export default function AdminDashboard() {
 
   useEffect(() => {
     api.get("/admin/usage").then((r) => setUsage(r.data));
-    api.get("/admin/users").then((r) => setUsers(r.data));
-    api.get("/admin/audit-logs").then((r) => setLogs(r.data));
+    api.get("/admin/users").then((r) => setUsers(r.data.users));
+    api.get("/admin/audit-logs").then((r) => setLogs(r.data.logs));
   }, []);
 
   return (

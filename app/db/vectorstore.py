@@ -44,7 +44,7 @@ async def embed_batch(texts: list[str]) -> list[list[float]]:
 # ============================================================
 # Insert
 # ============================================================
-async def upsert_chunks(db: AsyncSession, document_id: str, chunks: list[dict]):
+async def upsert_chunks(db: AsyncSession, document_id: str, chunks: list[dict],owner_id: str):
     texts = [c["content"] for c in chunks]
     embeddings = await embed_batch(texts)
 
@@ -56,6 +56,7 @@ async def upsert_chunks(db: AsyncSession, document_id: str, chunks: list[dict]):
                 content=c["content"],
                 embedding=emb,
                 page_number=c.get("page_number"),
+                owner_id=owner_id,
             ))
         await db.commit()
 
@@ -67,6 +68,7 @@ async def upsert_chunks(db: AsyncSession, document_id: str, chunks: list[dict]):
                 "values": emb,
                 "metadata": {
                     "document_id": document_id,
+                    "owner_id": owner_id,
                     "chunk_index": c["chunk_index"],
                     "content": c["content"],
                     "page_number": c.get("page_number"),
@@ -82,6 +84,7 @@ async def upsert_chunks(db: AsyncSession, document_id: str, chunks: list[dict]):
                 content=c["content"],
                 embedding=[0.0] * 1536,
                 page_number=c.get("page_number"),
+
             ))
         await db.commit()
 

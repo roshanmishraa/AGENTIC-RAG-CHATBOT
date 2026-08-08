@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     PORT: int = 8000
     SECRET_KEY: str = "change-me-in-production"
 
+    ALLOWED_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]
+
     # -----------------------------
     # Database (Postgres)
     # -----------------------------
@@ -43,6 +45,13 @@ class Settings(BaseSettings):
     SMTP_FROM_EMAIL: str = ""
     OTP_MODE: str = "mock"           # "mock" = print in logs (safe for demo), "live" = actually send
 
+   # Storage
+    STORAGE_BACKEND: str = "local"      # local | r2
+
+    R2_ACCOUNT_ID: str = ""             # Cloudflare Account ID
+    R2_ACCESS_KEY_ID: str = ""          # Step 5 se mila Access Key
+    R2_SECRET_ACCESS_KEY: str = ""      # Step 5 se mila Secret Key
+    R2_BUCKET_NAME: str = "rag-chatbot-files"
     # -----------------------------
     # Google OAuth2.0
     # -----------------------------
