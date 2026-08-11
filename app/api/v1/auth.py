@@ -60,6 +60,7 @@ class UserResponse(BaseModel):
     id: str
     email: str
     username: str
+    role: str
 
 
 
@@ -116,4 +117,4 @@ async def refresh(body: RefreshRequest):
 @router.get("/me", response_model=UserResponse)
 async def me(current_user=Depends(get_current_user)):
     # get_current_user from rbac.py already returns the User ORM object
-    return UserResponse(id=current_user.id, email=current_user.email, username=current_user.username)
+    return UserResponse(id=current_user.id, email=current_user.email, username=current_user.username, role=current_user.role.value)
