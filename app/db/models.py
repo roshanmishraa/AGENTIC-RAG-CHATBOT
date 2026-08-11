@@ -9,8 +9,7 @@ from sqlalchemy import (
     ForeignKey, DateTime, Enum, CheckConstraint, Index
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.dialects.postgresql import UUID, JSONB
-from pgvector.sqlalchemy import Vector
+from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
 
 
 class Base(DeclarativeBase):
@@ -34,8 +33,8 @@ class User(Base):
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
-    username: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)  # ← ADDED
-    hashed_password: Mapped[str] = mapped_column(String(255), nullable=True)   # ← nullable for OAuth users
+    username: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=True)   # nullable for OAuth users
     full_name: Mapped[str] = mapped_column(String(255), nullable=True)
     role: Mapped[UserRole] = mapped_column(Enum(UserRole), default=UserRole.USER, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -50,7 +49,7 @@ class User(Base):
 
 
 # =========================================================
-# Documents + chunk-level embeddings
+# Documents + chunk metadata (vectors live in Pinecone)
 # =========================================================
 class Document(Base):
     __tablename__ = "documents"
@@ -61,36 +60,33 @@ class Document(Base):
     file_type: Mapped[str] = mapped_column(String(50))
     status: Mapped[str] = mapped_column(String(50), default="processing")  # processing | ready | failed
     uploaded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    storage_path: Mapped[str] = mapped_column(String(1000), nullable=True)  # local path or R2 key
 
     owner: Mapped["User"] = relationship(back_populates="documents")
     chunks: Mapped[list["DocumentChunk"]] = relationship(back_populates="document", cascade="all, delete-orphan")
 
 
 class DocumentChunk(Base):
-    """Each chunk's text + pgvector embedding."""
+    """
+    Stores chunk text + metadata in Postgres.
+    The actual vector embedding lives in Pinecone (keyed by pinecone_vector_id).
+    No pgvector extension required.
+    """
     __tablename__ = "document_chunks"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
-    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)  # ← ondelete
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
     chunk_index: Mapped[int] = mapped_column(Integer)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(Vector(1536))  # text-embedding-3-small dims
     page_number: Mapped[int] = mapped_column(Integer, nullable=True)
     meta: Mapped[dict] = mapped_column(JSONB, default=dict)
 
+    # Pinecone vector ID — used to delete specific vectors when a document is removed
+    pinecone_vector_id: Mapped[str] = mapped_column(String(100), nullable=True, index=True)
+
     document: Mapped["Document"] = relationship(back_populates="chunks")
 
-    __table_args__ = (
-        # HNSW index — makes cosine similarity search fast at scale.
-        # Without this, every vector_search() is a full sequential scan.
-        Index(
-            "ix_document_chunks_embedding_hnsw",
-            "embedding",
-            postgresql_using="hnsw",
-            postgresql_with={"m": 16, "ef_construction": 64},
-            postgresql_ops={"embedding": "vector_cosine_ops"},
-        ),
-    )
+    # No HNSW index needed — Pinecone handles vector indexing externally
 
 
 # =========================================================
@@ -100,7 +96,7 @@ class Chat(Base):
     __tablename__ = "chats"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
-    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)  # ← ondelete
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     title: Mapped[str] = mapped_column(String(255), default="New Chat")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -112,7 +108,7 @@ class Message(Base):
     __tablename__ = "messages"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
-    chat_id: Mapped[str] = mapped_column(ForeignKey("chats.id", ondelete="CASCADE"), nullable=False)  # ← ondelete
+    chat_id: Mapped[str] = mapped_column(ForeignKey("chats.id", ondelete="CASCADE"), nullable=False)
     role: Mapped[str] = mapped_column(String(20))           # user | assistant | system
     content: Mapped[str] = mapped_column(Text)
     citations: Mapped[dict] = mapped_column(JSONB, default=dict)
@@ -131,14 +127,13 @@ class Feedback(Base):
     __tablename__ = "feedback"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
-    message_id: Mapped[str] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"), nullable=False)  # ← ondelete
+    message_id: Mapped[str] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"), nullable=False)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     rating: Mapped[int] = mapped_column(Integer)
     comment: Mapped[str] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
-        # DB-level constraint — Pydantic alone only enforces this at the API layer.
         CheckConstraint("rating IN (-1, 0, 1)", name="ck_feedback_valid_rating"),
     )
 
@@ -150,7 +145,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
-    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)  # ← SET NULL on user delete
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     action: Mapped[str] = mapped_column(String(255))
     detail: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

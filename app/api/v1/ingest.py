@@ -1,3 +1,5 @@
+# app/api/v1/ingest.py
+
 from __future__ import annotations
 import io
 import re
@@ -11,10 +13,10 @@ import pandas as pd
 
 from app.db.session import get_db
 from app.db.models import Document, User
-from app.db.vectorstore import upsert_chunks
+from app.db.vectorstore import upsert_chunks, delete_chunks_from_pinecone
 from app.security.rbac import get_current_user
 from app.security.rate_limiter import rate_limit_dependency
-from app.storage import get_storage          # ← R2 ya Local storage
+from app.storage import get_storage
 from app.settings import settings
 from app.observability.logger import get_logger
 
@@ -30,12 +32,12 @@ splitter = RecursiveCharacterTextSplitter(
 
 
 # ──────────────────────────────────────────────────────────
-# Text cleaning  (PDF artifacts, unicode normalisation, etc.)
+# Text cleaning
 # ──────────────────────────────────────────────────────────
 def _clean_text(text: str) -> str:
-    text = re.sub(r"-\n(\w)", r"\1", text)                           # fix hyphenated line-breaks
-    text = re.sub(r"\n{3,}", "\n\n", text)                           # collapse excess blank lines
-    text = re.sub(r"(?i)(page\s+\d+\s+of\s+\d+|- \d+ -)", "", text) # strip page-number artifacts
+    text = re.sub(r"-\n(\w)", r"\1", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"(?i)(page\s+\d+\s+of\s+\d+|- \d+ -)", "", text)
     text = (text.replace("\u2013", "-").replace("\u2014", "--")
                 .replace("\u2018", "'").replace("\u2019", "'")
                 .replace("\u201c", '"').replace("\u201d", '"'))
@@ -47,7 +49,6 @@ def _clean_text(text: str) -> str:
 # Extractors
 # ──────────────────────────────────────────────────────────
 def _extract_pdf(file_bytes: bytes) -> list[dict]:
-    """Returns [{"text": str, "page_number": int}, ...] — one entry per page."""
     reader = PdfReader(io.BytesIO(file_bytes))
     pages = []
     for i, page in enumerate(reader.pages):
@@ -86,7 +87,7 @@ async def upload_document(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # ── 1. Validate file type ──────────────────────────────
+    # 1. Validate file type
     file_ext = (file.filename or "").split(".")[-1].lower()
     if file_ext not in EXTRACTORS:
         raise HTTPException(
@@ -95,7 +96,7 @@ async def upload_document(
             f"Supported: {list(EXTRACTORS.keys())}",
         )
 
-    # ── 2. Read bytes + size check ─────────────────────────
+    # 2. Read bytes + size check
     file_bytes = await file.read()
     if not file_bytes:
         raise HTTPException(400, "Uploaded file is empty.")
@@ -106,7 +107,7 @@ async def upload_document(
             f"Maximum allowed size is 10 MB.",
         )
 
-    # ── 3. Save original file to storage (R2 or local) ─────
+    # 3. Save original file to storage (R2 or local)
     storage = get_storage()
     try:
         storage_path = await storage.save(
@@ -118,19 +119,19 @@ async def upload_document(
         logger.error(f"Storage save failed: {exc}", extra={"user_id": user.id})
         raise HTTPException(500, "Failed to save file to storage.")
 
-    # ── 4. Create Document row (status=processing) ─────────
+    # 4. Create Document row (status=processing)
     document = Document(
         owner_id=user.id,
         filename=file.filename,
         file_type=file_ext,
         status="processing",
-        storage_path=storage_path,   # ← local path or R2 key
+        storage_path=storage_path,
     )
     db.add(document)
     await db.commit()
     await db.refresh(document)
 
-    # ── 5. Parse → chunk → embed → store ──────────────────
+    # 5. Parse → chunk → embed → store in Pinecone + Postgres metadata
     try:
         pages = EXTRACTORS[file_ext](file_bytes)
         if not pages:
@@ -147,13 +148,11 @@ async def upload_document(
                 })
                 chunk_index += 1
 
-        # owner_id pass karna zaroori hai — Pinecone metadata mein
-        # user isolation ke liye (audit report CRIT-3 fix)
         await upsert_chunks(
             db,
             document_id=document.id,
             chunks=chunks,
-            owner_id=user.id,        # ← CRIT-3 fix
+            owner_id=user.id,
         )
 
         document.status = "ready"
@@ -176,16 +175,12 @@ async def upload_document(
         raise
 
     except Exception as exc:
-        # Mark failed but keep the Document row so user knows upload happened
         document.status = "failed"
         await db.commit()
-
-        # Try to clean up the stored file — don't crash if cleanup also fails
         try:
             await storage.delete(storage_path)
         except Exception:
             pass
-
         logger.error(
             f"Ingestion failed for {file.filename}: {exc}",
             extra={"user_id": user.id, "document_id": document.id},
@@ -194,7 +189,7 @@ async def upload_document(
 
 
 # ──────────────────────────────────────────────────────────
-# List documents  (user sirf apne docs dekh sakta hai)
+# List documents
 # ──────────────────────────────────────────────────────────
 @router.get("/documents")
 async def list_documents(
@@ -220,7 +215,7 @@ async def list_documents(
 
 
 # ──────────────────────────────────────────────────────────
-# Delete document  (owner hi delete kar sakta hai)
+# Delete document — removes vectors from Pinecone first
 # ──────────────────────────────────────────────────────────
 @router.delete("/documents/{document_id}", status_code=204)
 async def delete_document(
@@ -231,14 +226,23 @@ async def delete_document(
     result = await db.execute(
         select(Document).where(
             Document.id == document_id,
-            Document.owner_id == user.id,   # ← ownership check
+            Document.owner_id == user.id,   # ownership check
         )
     )
     doc = result.scalar_one_or_none()
     if not doc:
         raise HTTPException(404, "Document not found or does not belong to you.")
 
-    # Storage se file delete karo
+    # Delete vectors from Pinecone before removing Postgres rows
+    try:
+        await delete_chunks_from_pinecone(db, document_id)
+    except Exception as exc:
+        logger.warning(
+            f"Pinecone vector delete failed for document {document_id}: {exc}",
+            extra={"user_id": user.id},
+        )
+
+    # Delete original file from storage
     if doc.storage_path:
         try:
             storage = get_storage()
@@ -249,6 +253,6 @@ async def delete_document(
                 extra={"user_id": user.id, "document_id": document_id},
             )
 
-    # DB se document + chunks delete (cascade handle karta hai chunks)
+    # Postgres CASCADE removes document_chunks automatically
     await db.delete(doc)
     await db.commit()

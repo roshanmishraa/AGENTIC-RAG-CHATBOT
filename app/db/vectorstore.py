@@ -1,12 +1,17 @@
 # app/db/vectorstore.py
+#
+# Vector storage is handled exclusively by Pinecone.
+# Postgres stores chunk text + metadata; Pinecone stores embeddings.
+# pgvector extension is NOT required.
 
 from __future__ import annotations
 from typing import Optional
 import uuid
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from openai import AsyncOpenAI
+from pinecone import Pinecone
 
 from app.settings import settings
 from app.db.models import DocumentChunk, Document
@@ -17,13 +22,17 @@ _pinecone_index = None
 
 
 def _get_pinecone_index():
+    """Lazy singleton — initialises once and reuses the connection."""
     global _pinecone_index
     if _pinecone_index is None:
-        from pinecone import Pinecone
         pc = Pinecone(api_key=settings.PINECONE_API_KEY)
         _pinecone_index = pc.Index(settings.PINECONE_INDEX_NAME)
     return _pinecone_index
 
+
+# ============================================================
+# Embedding helpers
+# ============================================================
 
 async def embed_text(text_input: str) -> list[float]:
     response = await openai_client.embeddings.create(
@@ -42,129 +51,126 @@ async def embed_batch(texts: list[str]) -> list[list[float]]:
 
 
 # ============================================================
-# Insert
+# Insert — upsert to Pinecone + write metadata row to Postgres
 # ============================================================
-async def upsert_chunks(db: AsyncSession, document_id: str, chunks: list[dict],owner_id: str):
+
+async def upsert_chunks(
+    db: AsyncSession,
+    document_id: str,
+    chunks: list[dict],
+    owner_id: str,
+):
+    """
+    1. Embed all chunk texts in one batch call.
+    2. Upsert vectors to Pinecone with full metadata (enables filtered search).
+    3. Persist chunk text + pinecone_vector_id to Postgres for BM25 & audit.
+    """
     texts = [c["content"] for c in chunks]
     embeddings = await embed_batch(texts)
 
-    if settings.VECTOR_BACKEND == "pgvector":
-        for c, emb in zip(chunks, embeddings):
-            db.add(DocumentChunk(
+    index = _get_pinecone_index()
+
+    vectors = []
+    chunk_rows = []
+
+    for c, emb in zip(chunks, embeddings):
+        vector_id = str(uuid.uuid4())
+
+        vectors.append({
+            "id": vector_id,
+            "values": emb,
+            "metadata": {
+                "document_id": document_id,
+                "owner_id": owner_id,
+                "chunk_index": c["chunk_index"],
+                "content": c["content"],
+                "page_number": c.get("page_number"),
+            },
+        })
+
+        chunk_rows.append(
+            DocumentChunk(
                 document_id=document_id,
                 chunk_index=c["chunk_index"],
                 content=c["content"],
-                embedding=emb,
                 page_number=c.get("page_number"),
-                owner_id=owner_id,
-            ))
-        await db.commit()
+                pinecone_vector_id=vector_id,   # stored so we can delete later
+            )
+        )
 
-    elif settings.VECTOR_BACKEND == "pinecone":
+    # Upsert to Pinecone (namespace keeps tenants isolated at index level)
+    index.upsert(vectors=vectors, namespace=settings.PINECONE_NAMESPACE)
+
+    # Persist metadata rows to Postgres
+    for row in chunk_rows:
+        db.add(row)
+    await db.commit()
+
+
+# ============================================================
+# Delete — remove vectors from Pinecone when a document is deleted
+# ============================================================
+
+async def delete_chunks_from_pinecone(db: AsyncSession, document_id: str):
+    """
+    Call this before deleting a Document row.
+    Fetches all pinecone_vector_ids for the document, then bulk-deletes from Pinecone.
+    Postgres rows are removed automatically via CASCADE.
+    """
+    from sqlalchemy import select
+    result = await db.execute(
+        select(DocumentChunk.pinecone_vector_id)
+        .where(DocumentChunk.document_id == document_id)
+    )
+    vector_ids = [row[0] for row in result.all() if row[0]]
+
+    if vector_ids:
         index = _get_pinecone_index()
-        vectors = [
-            {
-                "id": str(uuid.uuid4()),
-                "values": emb,
-                "metadata": {
-                    "document_id": document_id,
-                    "owner_id": owner_id,
-                    "chunk_index": c["chunk_index"],
-                    "content": c["content"],
-                    "page_number": c.get("page_number"),
-                },
-            }
-            for c, emb in zip(chunks, embeddings)
-        ]
-        index.upsert(vectors=vectors)
-        for c in chunks:
-            db.add(DocumentChunk(
-                document_id=document_id,
-                chunk_index=c["chunk_index"],
-                content=c["content"],
-                embedding=[0.0] * 1536,
-                page_number=c.get("page_number"),
-
-            ))
-        await db.commit()
+        index.delete(ids=vector_ids, namespace=settings.PINECONE_NAMESPACE)
 
 
 # ============================================================
-# Similarity search
+# Similarity search — query Pinecone, return ranked chunks
 # ============================================================
+
 async def vector_search(
-    db: AsyncSession,
+    db: AsyncSession,          # kept for API compatibility with rag.py
     query: str,
     top_k: int,
     document_ids: Optional[list[str]] = None,
-    owner_id: Optional[str] = None,            # ← ADDED
+    owner_id: Optional[str] = None,
 ) -> list[dict]:
+    """
+    Embeds the query, then queries Pinecone with optional metadata filters.
+
+    owner_id      — security boundary: always applied when provided.
+    document_ids  — optional UX scope on top of ownership.
+    """
     query_embedding = await embed_text(query)
+    index = _get_pinecone_index()
 
-    if settings.VECTOR_BACKEND == "pgvector":
+    # Build Pinecone metadata filter
+    filter_: dict = {}
+    if owner_id:
+        filter_["owner_id"] = {"$eq": owner_id}
+    if document_ids:
+        filter_["document_id"] = {"$in": document_ids}
 
-        stmt = (
-            select(
-                DocumentChunk,
-                DocumentChunk.embedding.cosine_distance(query_embedding).label("distance"),
-            )
-            # JOIN Document so we can filter by owner_id
-            .join(Document, DocumentChunk.document_id == Document.id)
-        )
+    results = index.query(
+        vector=query_embedding,
+        top_k=top_k,
+        include_metadata=True,
+        namespace=settings.PINECONE_NAMESPACE,
+        filter=filter_ if filter_ else None,
+    )
 
-        # ── Security boundary — ALWAYS applied when owner_id is provided ──
-        # This ensures a user can never retrieve another user's chunks,
-        # even if they somehow know the document_id.
-        if owner_id:
-            stmt = stmt.where(Document.owner_id == owner_id)
-
-        # ── Optional UX scope — narrow to specific documents ──
-        # Sits on top of the owner filter, never replaces it.
-        if document_ids:
-            stmt = stmt.where(DocumentChunk.document_id.in_(document_ids))
-
-        # ORDER and LIMIT come LAST — after all WHERE clauses are applied.
-        # The old code had .where() after .limit() which caused Postgres
-        # to limit BEFORE filtering, returning wrong or insufficient results.
-        stmt = stmt.order_by("distance").limit(top_k)
-
-        result = await db.execute(stmt)
-        rows = result.all()
-        return [
-            {
-                "content": chunk.content,
-                "document_id": chunk.document_id,
-                "page_number": chunk.page_number,
-                "chunk_index": chunk.chunk_index,
-                "score": 1 - distance,
-            }
-            for chunk, distance in rows
-        ]
-
-    elif settings.VECTOR_BACKEND == "pinecone":
-        index = _get_pinecone_index()
-
-        # Pinecone filter — owner_id is the primary boundary,
-        # document_ids narrows further if provided.
-        filter_: dict = {}
-        if owner_id:
-            filter_["owner_id"] = {"$eq": owner_id}
-        if document_ids:
-            filter_["document_id"] = {"$in": document_ids}
-
-        results = index.query(
-            vector=query_embedding,
-            top_k=top_k,
-            include_metadata=True,
-            filter=filter_ if filter_ else None,
-        )
-        return [
-            {
-                "content": match["metadata"]["content"],
-                "document_id": match["metadata"]["document_id"],
-                "page_number": match["metadata"].get("page_number"),
-                "chunk_index": match["metadata"]["chunk_index"],
-                "score": match["score"],
-            }
-            for match in results["matches"]
-        ]
+    return [
+        {
+            "content": match["metadata"]["content"],
+            "document_id": match["metadata"]["document_id"],
+            "page_number": match["metadata"].get("page_number"),
+            "chunk_index": match["metadata"]["chunk_index"],
+            "score": match["score"],
+        }
+        for match in results["matches"]
+    ]

@@ -12,14 +12,15 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     HOST: str = "0.0.0.0"
     PORT: int = 8000
-    SECRET_KEY: str = "change-me-in-production"
+    SECRET_KEY: str = "agentic-rag-dev-secret-key-9f82k3mL7xPq21"
 
     ALLOWED_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 
     # -----------------------------
     # Database (Postgres)
     # -----------------------------
-    DATABASE_URL: str = "postgresql+asyncpg://rag_user:rag_password@localhost:5432/rag_chatbot"
+    SYNC_DATABASE_URL: str = "postgresql://postgres:Roshan1234@127.0.0.1:5432/rag_chatbot_db"
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:Roshan1234@127.0.0.1:5432/rag_chatbot_db"
 
     # -----------------------------
     # Redis
@@ -74,7 +75,7 @@ class Settings(BaseSettings):
     # -----------------------------
     # Vector Backend (dual support)
     # -----------------------------
-    VECTOR_BACKEND: str = "pgvector"      # "pgvector" | "pinecone" — pgvector chosen since local Postgres already has the extension
+    # VECTOR_BACKEND: str = "pinecone"      # "pgvector" | "pinecone" — pgvector chosen since local Postgres already has the extension
 
     PINECONE_API_KEY: str = ""
     PINECONE_ENVIRONMENT: str = "us-east-1"

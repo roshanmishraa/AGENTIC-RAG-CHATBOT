@@ -1,3 +1,5 @@
+# app/db/session.py
+
 from sqlalchemy.ext.asyncio import (
     create_async_engine, async_sessionmaker, AsyncSession
 )
@@ -36,11 +38,9 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db():
     """
-    Called once on startup. Creates the pgvector extension (if missing)
-    and all tables. In production, prefer Alembic migrations instead
-    of create_all — but this is a safe first-run bootstrap.
+    Called once on startup.
+    Creates all Postgres tables (users, documents, document_chunks, etc.).
+    pgvector extension is NOT needed — vectors live in Pinecone.
     """
     async with engine.begin() as conn:
-        from sqlalchemy import text
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)

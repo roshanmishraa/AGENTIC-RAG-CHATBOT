@@ -1,5 +1,5 @@
 # requirements.txt mein add karo: asteval
-
+from langchain_core.tools import tool
 from asteval import Interpreter
 
 @tool
