@@ -1,54 +1,174 @@
-import { useEffect, useState } from "react";
-import { api } from "../api/client";
+import { useCallback, useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { Menu } from "lucide-react";
+import { useAuthStore } from "../store/authStore";
+import { adminAPI, authAPI } from "../api/client";
+import type { AdminUser, AuditLog, UsageStats } from "../types";
+import {
+  AdminSidebar,
+  AuditLogTable,
+  Pagination,
+  UsageStatsGrid,
+  UsersTable,
+} from "../components/admin";
+import type { AdminSection } from "../components/admin";
+import { ErrorState, IconButton, LoadingState, useToast } from "../components/ui";
+
+const PAGE_SIZE = 20;
+
+const sectionTitles: Record<AdminSection, string> = {
+  overview: "Dashboard",
+  users: "Users",
+  "audit-logs": "Audit Logs",
+};
 
 export default function AdminDashboard() {
-  const [usage, setUsage] = useState<any>(null);
-  const [users, setUsers] = useState<any[]>([]);
-  const [logs, setLogs] = useState<any[]>([]);
+  const navigate = useNavigate();
+  const toast = useToast();
+  const { user, logout } = useAuthStore();
 
-  useEffect(() => {
-    api.get("/admin/usage").then((r) => setUsage(r.data));
-    api.get("/admin/users").then((r) => setUsers(r.data.users));
-    api.get("/admin/audit-logs").then((r) => setLogs(r.data.logs));
+  const [section, setSection] = useState<AdminSection>("overview");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  const [usage, setUsage] = useState<UsageStats | null>(null);
+  const [usageError, setUsageError] = useState(false);
+
+  const [users, setUsers] = useState<AdminUser[]>([]);
+  const [usersTotal, setUsersTotal] = useState(0);
+  const [usersOffset, setUsersOffset] = useState(0);
+  const [usersLoading, setUsersLoading] = useState(false);
+  const [deactivatingId, setDeactivatingId] = useState<string | null>(null);
+
+  const [logs, setLogs] = useState<AuditLog[]>([]);
+  const [logsTotal, setLogsTotal] = useState(0);
+  const [logsOffset, setLogsOffset] = useState(0);
+  const [logsLoading, setLogsLoading] = useState(false);
+
+  const loadUsage = useCallback(async () => {
+    setUsageError(false);
+    try {
+      const { data } = await adminAPI.usage();
+      setUsage(data);
+    } catch {
+      setUsageError(true);
+    }
   }, []);
 
+  const loadUsers = useCallback(async (offset: number) => {
+    setUsersLoading(true);
+    try {
+      const { data } = await adminAPI.users(PAGE_SIZE, offset);
+      setUsers(data.users);
+      setUsersTotal(data.total);
+    } catch {
+      toast.push("Unable to load users", "danger");
+    } finally {
+      setUsersLoading(false);
+    }
+  }, [toast]);
+
+  const loadLogs = useCallback(async (offset: number) => {
+    setLogsLoading(true);
+    try {
+      const { data } = await adminAPI.auditLogs(PAGE_SIZE, offset);
+      setLogs(data.logs);
+      setLogsTotal(data.total);
+    } catch {
+      toast.push("Unable to load audit logs", "danger");
+    } finally {
+      setLogsLoading(false);
+    }
+  }, [toast]);
+
+  useEffect(() => {
+    loadUsage();
+  }, [loadUsage]);
+
+  useEffect(() => {
+    if (section === "users") loadUsers(usersOffset);
+  }, [section, usersOffset, loadUsers]);
+
+  useEffect(() => {
+    if (section === "audit-logs") loadLogs(logsOffset);
+  }, [section, logsOffset, loadLogs]);
+
+  const handleDeactivate = async (userId: string) => {
+    setDeactivatingId(userId);
+    try {
+      await adminAPI.deactivateUser(userId);
+      toast.push("User deactivated", "success");
+      setUsers((prev) => prev.map((u) => (u.id === userId ? { ...u, is_active: false } : u)));
+    } catch (err: any) {
+      toast.push(err.response?.data?.detail || "Could not deactivate user", "danger");
+    } finally {
+      setDeactivatingId(null);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      const rt = useAuthStore.getState().refreshToken;
+      if (rt) await authAPI.logout(rt);
+    } catch {
+      // best-effort
+    }
+    logout();
+    navigate("/login");
+  };
+
   return (
-    <div className="p-8 max-w-5xl mx-auto space-y-8">
-      <h1 className="text-2xl font-semibold">Admin Dashboard</h1>
+    <div className="flex h-screen bg-base overflow-hidden">
+      <AdminSidebar
+        section={section}
+        onSectionChange={(s) => {
+          setSection(s);
+          setSidebarOpen(false);
+        }}
+        user={user}
+        onBackToChat={() => navigate("/chat")}
+        onLogout={handleLogout}
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+      />
 
-      {usage && (
-        <div className="grid grid-cols-5 gap-4">
-          {Object.entries(usage).map(([key, value]) => (
-            <div key={key} className="bg-white p-4 rounded-lg shadow-sm">
-              <p className="text-xs text-gray-500">{key.replace(/_/g, " ")}</p>
-              <p className="text-xl font-semibold">{String(value)}</p>
-            </div>
-          ))}
+      <div className="flex-1 flex flex-col min-w-0">
+        <div className="flex items-center gap-2 h-14 px-4 border-b border-border shrink-0">
+          <IconButton label="Open menu" onClick={() => setSidebarOpen(true)} className="md:hidden">
+            <Menu size={18} />
+          </IconButton>
+          <h1 className="text-sm font-semibold text-primary">{sectionTitles[section]}</h1>
         </div>
-      )}
 
-      <div>
-        <h2 className="font-medium mb-2">Users</h2>
-        <table className="w-full text-sm bg-white rounded-lg overflow-hidden">
-          <thead className="bg-gray-100">
-            <tr><th className="p-2 text-left">Email</th><th className="p-2 text-left">Role</th><th className="p-2 text-left">Active</th></tr>
-          </thead>
-          <tbody>
-            {users.map((u) => (
-              <tr key={u.id} className="border-t">
-                <td className="p-2">{u.email}</td><td className="p-2">{u.role}</td><td className="p-2">{u.is_active ? "Yes" : "No"}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+        <div className="flex-1 overflow-y-auto p-4 md:p-6">
+          <div className="max-w-5xl mx-auto">
+            {section === "overview" &&
+              (usageError ? (
+                <ErrorState message="Unable to load usage statistics." onRetry={loadUsage} />
+              ) : usage ? (
+                <UsageStatsGrid usage={usage} />
+              ) : (
+                <LoadingState label="Loading usage statistics..." />
+              ))}
 
-      <div>
-        <h2 className="font-medium mb-2">Recent Activity</h2>
-        <div className="bg-white rounded-lg p-4 space-y-1 text-sm max-h-64 overflow-y-auto">
-          {logs.map((l) => (
-            <p key={l.id} className="text-gray-600">{l.action} — {new Date(l.created_at).toLocaleString()}</p>
-          ))}
+            {section === "users" && (
+              <>
+                <UsersTable
+                  users={users}
+                  loading={usersLoading}
+                  onDeactivate={handleDeactivate}
+                  deactivatingId={deactivatingId}
+                />
+                <Pagination offset={usersOffset} limit={PAGE_SIZE} total={usersTotal} onChange={setUsersOffset} />
+              </>
+            )}
+
+            {section === "audit-logs" && (
+              <>
+                <AuditLogTable logs={logs} loading={logsLoading} />
+                <Pagination offset={logsOffset} limit={PAGE_SIZE} total={logsTotal} onChange={setLogsOffset} />
+              </>
+            )}
+          </div>
         </div>
       </div>
     </div>

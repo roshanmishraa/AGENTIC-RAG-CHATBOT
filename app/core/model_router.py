@@ -34,11 +34,11 @@ def classify_complexity(query: str) -> QueryComplexity:
 
 
 def _build_openai(model_name: str):
-    return ChatOpenAI(api_key=settings.OPENAI_API_KEY, model=model_name, temperature=0.2)
+    return ChatOpenAI(api_key=settings.OPENAI_API_KEY, model=model_name, temperature=0.2,streaming=True)
 
 
 def _build_google():
-    return ChatGoogleGenerativeAI(google_api_key=settings.GOOGLE_API_KEY, model=settings.GOOGLE_MODEL, temperature=0.2)
+    return ChatGoogleGenerativeAI(google_api_key=settings.GOOGLE_API_KEY, model=settings.GOOGLE_MODEL, temperature=0.2, streaming=True)
 
 
 @retry(

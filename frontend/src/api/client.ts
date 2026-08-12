@@ -141,6 +141,25 @@ export const authAPI = {
 
 
 
+export const usersAPI = {
+
+  me: () =>
+    api.get(
+      "/users/me"
+    ),
+
+  updateMe: (
+    payload: { full_name?: string; phone_number?: string; username?: string }
+  ) =>
+    api.patch(
+      "/users/me",
+      payload
+    ),
+
+};
+
+
+
 export const chatAPI = {
 
   sendMessage: (
@@ -161,6 +180,58 @@ export const chatAPI = {
             : undefined,
       }
     ),
+
+  sendImageMessage: (
+    chatId: string,
+    query: string,
+    image: File,
+    documentIds?: string[]
+  ) => {
+
+    const fd = new FormData();
+    fd.append("chat_id", chatId);
+    fd.append("query", query);
+    fd.append("image", image);
+    if (documentIds?.length) {
+      fd.append("document_ids", documentIds.join(","));
+    }
+
+    return api.post(
+      "/chat/message/image",
+      fd,
+      {
+        headers: {
+          "Content-Type": "multipart/form-data",
+        },
+      }
+    );
+
+  },
+
+  sendVoiceMessage: (
+    chatId: string,
+    audioBlob: Blob,
+    documentIds?: string[]
+  ) => {
+
+    const fd = new FormData();
+    fd.append("chat_id", chatId);
+    fd.append("audio", audioBlob, "recording.webm");
+    if (documentIds?.length) {
+      fd.append("document_ids", documentIds.join(","));
+    }
+
+    return api.post(
+      "/chat/message/voice",
+      fd,
+      {
+        headers: {
+          "Content-Type": "multipart/form-data",
+        },
+      }
+    );
+
+  },
 
 };
 
@@ -197,6 +268,13 @@ export const ingestAPI = {
   listDocuments: () =>
     api.get(
       "/ingest/documents"
+    ),
+
+  deleteDocument: (
+    documentId: string
+  ) =>
+    api.delete(
+      `/ingest/documents/${documentId}`
     ),
 
 };
